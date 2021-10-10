@@ -31,7 +31,7 @@ from substrateinterface.utils.hasher import blake2_256
 from app.models.data import Log, AccountAudit, Account, AccountIndexAudit, AccountIndex, \
     SessionValidator, IdentityAudit, IdentityJudgementAudit, IdentityJudgement, SearchIndex, AccountInfoSnapshot
 
-from app.utils.ss58 import ss58_encode, ss58_encode_account_index
+from scalecodec.utils.ss58 import ss58_encode, ss58_encode_account_index
 from scalecodec.base import ScaleBytes, RuntimeConfiguration
 
 from app.processors.base import BlockProcessor
