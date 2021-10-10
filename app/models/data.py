@@ -230,7 +230,7 @@ class Account(BaseModel):
     __tablename__ = 'data_account'
 
     id = sa.Column(sa.String(64), primary_key=True)
-    address = sa.Column(sa.String(48), index=True)
+    address = sa.Column(sa.String(49), index=True)
     index_address = sa.Column(sa.String(24), index=True)
     is_reaped = sa.Column(sa.Boolean, default=False)
 
