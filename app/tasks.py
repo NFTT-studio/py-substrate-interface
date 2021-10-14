@@ -117,6 +117,7 @@ def accumulate_block_recursive(self, block_hash, end_block_hash=None):
         for nr in range(0, 10):
             if not block or block.id > 0:
                 # Process block
+                # this
                 block = harvester.add_block(block_hash)
 
                 print('+ Added {} {} '.format(block.id, block_hash))
@@ -208,7 +209,7 @@ def rebuilding_search_index(self, search_index_id=None, truncate=False):
 
 
 @app.task(base=BaseTask, bind=True)
-def start_harvester(self, check_gaps=False):
+def start_harvester(self, check_gaps=True):
 
     substrate = SubstrateInterface(
         url=SUBSTRATE_RPC_URL,
@@ -245,6 +246,13 @@ def start_harvester(self, check_gaps=False):
     else:
         start_block_hash = substrate.get_chain_head()
 
+    # block_0 = '0xfcf9074303d8f319ad1bf0195b145871977e7c375883b834247cb01ff22f51f9' # 0
+    # block_1 = '0xb0f726b3bf53ceef18b5336c01beb1e531909a5b2b2080b3a02b4c6724d9788e' # 1
+    # block_12433 = '0x7d26a476a7f244af2e8dc6548f723b0c9f20318440b36f10cf07424201033f1c' # 12433
+
+    # start_block_hash = block_12433
+
+    # end_block_hash = block_1
     end_block_hash = None
 
     accumulate_block_recursive.delay(start_block_hash, end_block_hash)

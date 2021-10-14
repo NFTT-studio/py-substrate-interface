@@ -602,84 +602,88 @@ class PolkascanHarvesterService(BaseService):
 
         extrinsics = []
 
-        for extrinsic in extrinsics_data:
-
+        for nth, extrinsic in enumerate(extrinsics_data):
             extrinsics_decoder = ExtrinsicsDecoder(
                 data=ScaleBytes(extrinsic),
                 metadata=self.metadata_store[parent_spec_version]
             )
+            print('======= parent spec version', nth, parent_spec_version) #, self.metadata_store[parent_spec_version])
 
-            extrinsic_data = extrinsics_decoder.decode()
+            try:
+                extrinsic_data = extrinsics_decoder.decode() # here
 
-            # Lookup result of extrinsic
-            extrinsic_success = extrinsic_success_idx.get(extrinsic_idx, False)
+                # Lookup result of extrinsic
+                extrinsic_success = extrinsic_success_idx.get(extrinsic_idx, False)
 
-            if extrinsics_decoder.era:
-                era = extrinsics_decoder.era.raw_value
-            else:
-                era = None
+                if extrinsics_decoder.era:
+                    era = extrinsics_decoder.era.raw_value
+                else:
+                    era = None
 
-            model = Extrinsic(
-                block_id=block_id,
-                extrinsic_idx=extrinsic_idx,
-                extrinsic_hash=extrinsics_decoder.extrinsic_hash,
-                extrinsic_length=extrinsic_data.get('extrinsic_length'),
-                extrinsic_version=extrinsic_data.get('version_info'),
-                signed=extrinsics_decoder.contains_transaction,
-                unsigned=not extrinsics_decoder.contains_transaction,
-                signedby_address=bool(extrinsics_decoder.contains_transaction and extrinsic_data.get('account_id')),
-                signedby_index=bool(extrinsics_decoder.contains_transaction and extrinsic_data.get('account_index')),
-                address_length=extrinsic_data.get('account_length'),
-                address=extrinsic_data.get('account_id'),
-                account_index=extrinsic_data.get('account_index'),
-                account_idx=extrinsic_data.get('account_idx'),
-                signature=extrinsic_data.get('signature'),
-                nonce=extrinsic_data.get('nonce'),
-                era=era,
-                call=extrinsic_data.get('call_code'),
-                module_id=extrinsic_data.get('call_module'),
-                call_id=extrinsic_data.get('call_function'),
-                params=extrinsic_data.get('params'),
-                spec_version_id=parent_spec_version,
-                success=int(extrinsic_success),
-                error=int(not extrinsic_success),
-                codec_error=False
-            )
-            model.save(self.db_session)
-
-            extrinsics.append(model)
-
-            extrinsic_idx += 1
-
-            # Process extrinsic
-            if extrinsics_decoder.contains_transaction:
-                block.count_extrinsics_signed += 1
-
-                if model.signedby_address:
-                    block.count_extrinsics_signedby_address += 1
-                if model.signedby_index:
-                    block.count_extrinsics_signedby_index += 1
-
-                # Add search index for signed extrinsics
-                search_index = SearchIndex(
-                    index_type_id=settings.SEARCH_INDEX_SIGNED_EXTRINSIC,
-                    block_id=block.id,
-                    extrinsic_idx=model.extrinsic_idx,
-                    account_id=model.address
+                model = Extrinsic(
+                    block_id=block_id,
+                    extrinsic_idx=extrinsic_idx,
+                    extrinsic_hash=extrinsics_decoder.extrinsic_hash,
+                    extrinsic_length=extrinsic_data.get('extrinsic_length'),
+                    extrinsic_version=extrinsic_data.get('version_info'),
+                    signed=extrinsics_decoder.contains_transaction,
+                    unsigned=not extrinsics_decoder.contains_transaction,
+                    signedby_address=bool(extrinsics_decoder.contains_transaction and extrinsic_data.get('account_id')),
+                    signedby_index=bool(extrinsics_decoder.contains_transaction and extrinsic_data.get('account_index')),
+                    address_length=extrinsic_data.get('account_length'),
+                    address=extrinsic_data.get('account_id'),
+                    account_index=extrinsic_data.get('account_index'),
+                    account_idx=extrinsic_data.get('account_idx'),
+                    signature=extrinsic_data.get('signature'),
+                    nonce=extrinsic_data.get('nonce'),
+                    era=era,
+                    call=extrinsic_data.get('call_code'),
+                    module_id=extrinsic_data.get('call_module'),
+                    call_id=extrinsic_data.get('call_function'),
+                    params=extrinsic_data.get('params'),
+                    spec_version_id=parent_spec_version,
+                    success=int(extrinsic_success),
+                    error=int(not extrinsic_success),
+                    codec_error=False
                 )
-                search_index.save(self.db_session)
+                model.save(self.db_session)
 
-            else:
-                block.count_extrinsics_unsigned += 1
+                extrinsics.append(model)
 
-            # Process extrinsic processors
-            for processor_class in ProcessorRegistry().get_extrinsic_processors(model.module_id, model.call_id):
-                extrinsic_processor = processor_class(block, model, substrate=self.substrate)
-                extrinsic_processor.accumulation_hook(self.db_session)
-                extrinsic_processor.process_search_index(self.db_session)
+                extrinsic_idx += 1
+
+                # Process extrinsic
+                if extrinsics_decoder.contains_transaction:
+                    block.count_extrinsics_signed += 1
+
+                    if model.signedby_address:
+                        block.count_extrinsics_signedby_address += 1
+                    if model.signedby_index:
+                        block.count_extrinsics_signedby_index += 1
+
+                    # Add search index for signed extrinsics
+                    search_index = SearchIndex(
+                        index_type_id=settings.SEARCH_INDEX_SIGNED_EXTRINSIC,
+                        block_id=block.id,
+                        extrinsic_idx=model.extrinsic_idx,
+                        account_id=model.address
+                    )
+                    search_index.save(self.db_session)
+
+                else:
+                    block.count_extrinsics_unsigned += 1
+
+                # Process extrinsic processors
+                for processor_class in ProcessorRegistry().get_extrinsic_processors(model.module_id, model.call_id):
+                    extrinsic_processor = processor_class(block, model, substrate=self.substrate)
+                    extrinsic_processor.accumulation_hook(self.db_session)
+                    extrinsic_processor.process_search_index(self.db_session)
+
+            except Exception as e:
+                print(e)
 
         # Process event processors
-        for event in events:
+        for nth, event in enumerate(events):
             extrinsic = None
             if event.extrinsic_idx is not None:
                 try:
