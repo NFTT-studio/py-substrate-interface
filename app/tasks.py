@@ -249,10 +249,13 @@ def start_harvester(self, check_gaps=True):
     # block_0 = '0xfcf9074303d8f319ad1bf0195b145871977e7c375883b834247cb01ff22f51f9' # 0
     # block_1 = '0xb0f726b3bf53ceef18b5336c01beb1e531909a5b2b2080b3a02b4c6724d9788e' # 1
     # block_12433 = '0x7d26a476a7f244af2e8dc6548f723b0c9f20318440b36f10cf07424201033f1c' # 12433
+    # block_491918 = '0x301ccd93f263468c8a1cb0c2b81c26cbc243bab1d5a67866aebdd39ef9987f0a' # 491918
+    # block_491917 = '0xad7d99feab8384105f1fb4a6569ca250803ce5bd1d93ab0a3d2944a9708f799e' # 491917
 
-    # start_block_hash = block_12433
+    # start_block_hash = block_491918
 
     # end_block_hash = block_1
+    # end_block_hash = block_491917
     end_block_hash = None
 
     accumulate_block_recursive.delay(start_block_hash, end_block_hash)

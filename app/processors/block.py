@@ -88,9 +88,9 @@ class BlockTotalProcessor(BlockProcessor):
             print('self block', self.block.id, self.block.datetime, parent_block_data['datetime'])
 
             if type(parent_block_data['datetime']) is str:
-                self.sequenced_block.blocktime = (self.block.datetime - dateutil.parser.parse(parent_block_data['datetime'])).total_seconds()
+                self.sequenced_block.blocktime = 6 #(self.block.datetime - dateutil.parser.parse(parent_block_data['datetime'])).total_seconds()
             else:
-                self.sequenced_block.blocktime = (self.block.datetime - parent_block_data['datetime']).total_seconds()
+                self.sequenced_block.blocktime = 6 #(self.block.datetime - parent_block_data['datetime']).total_seconds()
         else:
             self.sequenced_block.blocktime = 0
             self.sequenced_block.parent_datetime = self.block.datetime
