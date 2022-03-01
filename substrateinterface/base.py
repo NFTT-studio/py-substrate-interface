@@ -910,9 +910,14 @@ class SubstrateInterface:
                     metadata=metadata_decoder,
                     runtime_config=self.runtime_config
                 )
-                events_decoder.decode()
-
-                return events_decoder
+                try:
+                    events_decoder.decode()
+                    return events_decoder
+                except Exception as e:
+                    print('[PLAN-A] error decoding events, setting events to []', e);
+                    events_decoder.elements = []
+                    # return response
+                    return events_decoder
 
             else:
                 return response
