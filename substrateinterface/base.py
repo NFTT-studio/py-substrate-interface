@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import warnings
-from functools import lru_cache
 from hashlib import blake2b
 
 import binascii
@@ -24,30 +23,29 @@ import logging
 import re
 
 import requests
-from typing import Optional
+from typing import Optional, Union
 
+from eth_keys.datatypes import PrivateKey
 from websocket import create_connection, WebSocketConnectionClosedException
 
-from scalecodec import ScaleBytes, GenericCall, GenericAccountId
-from scalecodec.base import ScaleDecoder, RuntimeConfigurationObject, ScaleType
-from scalecodec.block import ExtrinsicsDecoder, EventsDecoder, LogDigest, Extrinsic
-from scalecodec.metadata import MetadataDecoder
+from scalecodec.base import ScaleDecoder, ScaleBytes, RuntimeConfigurationObject, ScaleType
+from scalecodec.types import GenericCall, GenericExtrinsic, Extrinsic
 from scalecodec.type_registry import load_type_registry_preset
 from scalecodec.updater import update_type_registries
 
 from .key import extract_derive_path
-from .utils.caching import block_dependent_lru_cache
+from .utils.ecdsa_helpers import mnemonic_to_ecdsa_private_key, ecdsa_verify, ecdsa_sign
 from .utils.hasher import blake2_256, two_x64_concat, xxh128, blake2_128, blake2_128_concat, identity
 from .exceptions import SubstrateRequestException, ConfigurationError, StorageFunctionNotFound, BlockNotFound, \
     ExtrinsicNotFound
 from .constants import *
 from .utils.ss58 import ss58_decode, ss58_encode, is_valid_ss58_address
 
-from bip39 import bip39_to_mini_secret, bip39_generate
+from bip39 import bip39_to_mini_secret, bip39_generate, bip39_validate
 import sr25519
-import ed25519
+import ed25519_dalek
 
-__all__ = ['Keypair', 'KeypairType', 'SubstrateInterface', 'ExtrinsicReceipt', 'logger']
+__all__ = ['Keypair', 'KeypairType', 'SubstrateInterface', 'ExtrinsicReceipt', 'logger', 'MnemonicLanguageCode']
 
 logger = logging.getLogger(__name__)
 
@@ -55,24 +53,34 @@ logger = logging.getLogger(__name__)
 class KeypairType:
     ED25519 = 0
     SR25519 = 1
+    ECDSA = 2
+
+
+class MnemonicLanguageCode:
+    ENGLISH = 'en'
+    CHINESE_SIMPLIFIED = 'zh-hans'
+    CHINESE_TRADITIONAL = 'zh-hant'
+    FRENCH = 'fr'
+    ITALIAN = 'it'
+    JAPANESE = 'ja'
+    KOREAN = 'ko'
+    SPANISH = 'es'
 
 
 class Keypair:
 
-    def __init__(self, ss58_address=None, public_key=None, private_key=None, ss58_format=None,
-                 address_type=None, seed_hex=None,
-                 crypto_type=KeypairType.SR25519):
+    def __init__(self, ss58_address: str = None, public_key: bytes = None, private_key: Union[bytes, str] = None,
+                 ss58_format: int = None, seed_hex: str = None, crypto_type: int = KeypairType.SR25519):
         """
-        Allows generation of Keypairs from a variety of input combination, such as a public/private key combination, a
-        mnemonic or a uri containing soft and hard derivation paths. With these Keypairs data can be signed and verified
+        Allows generation of Keypairs from a variety of input combination, such as a public/private key combination,
+        mnemonic or URI containing soft and hard derivation paths. With these Keypairs data can be signed and verified
 
         Parameters
         ----------
         ss58_address: Substrate address
         public_key: hex string or bytes of public_key key
         private_key: hex string or bytes of private key
-        ss58_format: Substrate address format, default = 42
-        address_type: (deprecated) replaced by ss58_format
+        ss58_format: Substrate address format, default to 42 when omitted
         seed_hex: hex string of seed
         crypto_type: Use KeypairType.SR25519 or KeypairType.ED25519 cryptography for generating the Keypair
         """
@@ -81,64 +89,83 @@ class Keypair:
         self.seed_hex = seed_hex
         self.derive_path = None
 
-        if ss58_address and not public_key:
+        if crypto_type != KeypairType.ECDSA and ss58_address and not public_key:
             public_key = ss58_decode(ss58_address, valid_ss58_format=ss58_format)
+
+        if private_key:
+
+            if type(private_key) is str:
+                private_key = bytes.fromhex(private_key.replace('0x', ''))
+
+            if self.crypto_type == KeypairType.SR25519 and len(private_key) != 64:
+                raise ValueError('Secret key should be 64 bytes long')
+
+            if self.crypto_type == KeypairType.ECDSA:
+                private_key_obj = PrivateKey(private_key)
+                public_key = private_key_obj.public_key.to_address()
+                ss58_address = private_key_obj.public_key.to_checksum_address()
 
         if not public_key:
             raise ValueError('No SS58 formatted address or public key provided')
 
-        if type(public_key) is bytes:
-            public_key = public_key.hex()
+        if type(public_key) is str:
+            public_key = bytes.fromhex(public_key.replace('0x', ''))
 
-        public_key = '0x{}'.format(public_key.replace('0x', ''))
+        if crypto_type == KeypairType.ECDSA:
+            if len(public_key) != 20:
+                raise ValueError('Public key should be 20 bytes long')
+        else:
+            if len(public_key) != 32:
+                raise ValueError('Public key should be 32 bytes long')
 
-        if len(public_key) != 66:
-            raise ValueError('Public key should be 32 bytes long')
+            if not ss58_address:
+                ss58_address = ss58_encode(public_key, ss58_format=ss58_format)
 
-        if address_type is not None:
-            warnings.warn("Keyword 'address_type' will be replaced by 'ss58_format'", DeprecationWarning)
-            ss58_format = address_type
+        self.ss58_format: int = ss58_format
 
-        self.ss58_format = ss58_format
+        self.public_key: bytes = public_key
 
-        if not ss58_address:
-            ss58_address = ss58_encode(public_key, ss58_format=ss58_format)
+        self.ss58_address: str = ss58_address
 
-        self.public_key = public_key
-
-        self.ss58_address = ss58_address
-
-        if private_key:
-
-            if type(private_key) is bytes:
-                private_key = private_key.hex()
-
-            private_key = '0x{}'.format(private_key.replace('0x', ''))
-
-            if self.crypto_type == KeypairType.SR25519 and len(private_key) != 130:
-                raise ValueError('Secret key should be 64 bytes long')
-
-        self.private_key = private_key
+        self.private_key: bytes = private_key
 
         self.mnemonic = None
 
     @classmethod
-    def generate_mnemonic(cls, words=12):
+    def generate_mnemonic(cls, words: int = 12, language_code: str = MnemonicLanguageCode.ENGLISH) -> str:
         """
         Generates a new seed phrase with given amount of words (default 12)
 
         Parameters
         ----------
         words: The amount of words to generate, valid values are 12, 15, 18, 21 and 24
+        language_code: The language to use, valid values are: 'en', 'zh-hans', 'zh-hant', 'fr', 'it', 'ja', 'ko', 'es'. Defaults to `MnemonicLanguageCode.ENGLISH`
 
         Returns
         -------
-        Seed phrase
+        str: Seed phrase
         """
-        return bip39_generate(words)
+        return bip39_generate(words, language_code)
 
     @classmethod
-    def create_from_mnemonic(cls, mnemonic, ss58_format=42, address_type=None, crypto_type=KeypairType.SR25519):
+    def validate_mnemonic(cls, mnemonic: str, language_code: str = MnemonicLanguageCode.ENGLISH) -> bool:
+        """
+        Verify if specified mnemonic is valid
+
+        Parameters
+        ----------
+        mnemonic: Seed phrase
+        language_code: The language to use, valid values are: 'en', 'zh-hans', 'zh-hant', 'fr', 'it', 'ja', 'ko', 'es'. Defaults to `MnemonicLanguageCode.ENGLISH`
+
+        Returns
+        -------
+        bool
+        """
+        return bip39_validate(mnemonic, language_code)
+
+    @classmethod
+    def create_from_mnemonic(cls, mnemonic: str, ss58_format=42, crypto_type=KeypairType.SR25519,
+                             language_code: str = MnemonicLanguageCode.ENGLISH) -> 'Keypair':
         """
         Create a Keypair for given memonic
 
@@ -146,31 +173,37 @@ class Keypair:
         ----------
         mnemonic: Seed phrase
         ss58_format: Substrate address format
-        address_type: (deprecated)
         crypto_type: Use `KeypairType.SR25519` or `KeypairType.ED25519` cryptography for generating the Keypair
+        language_code: The language to use, valid values are: 'en', 'zh-hans', 'zh-hant', 'fr', 'it', 'ja', 'ko', 'es'. Defaults to `MnemonicLanguageCode.ENGLISH`
 
         Returns
         -------
         Keypair
         """
-        seed_array = bip39_to_mini_secret(mnemonic, "")
 
-        if address_type is not None:
-            warnings.warn("Keyword 'address_type' will be replaced by 'ss58_format'", DeprecationWarning)
-            ss58_format = address_type
+        if crypto_type == KeypairType.ECDSA:
+            if language_code != MnemonicLanguageCode.ENGLISH:
+                raise ValueError("ECDSA mnemonic only supports english")
 
-        keypair = cls.create_from_seed(
-            seed_hex=binascii.hexlify(bytearray(seed_array)).decode("ascii"),
-            ss58_format=ss58_format,
-            crypto_type=crypto_type
-        )
+            private_key = mnemonic_to_ecdsa_private_key(mnemonic)
+            keypair = cls.create_from_private_key(private_key, ss58_format=ss58_format, crypto_type=crypto_type)
+
+        else:
+            seed_array = bip39_to_mini_secret(mnemonic, "", language_code)
+
+            keypair = cls.create_from_seed(
+                seed_hex=binascii.hexlify(bytearray(seed_array)).decode("ascii"),
+                ss58_format=ss58_format,
+                crypto_type=crypto_type
+            )
+
         keypair.mnemonic = mnemonic
 
         return keypair
 
     @classmethod
     def create_from_seed(
-            cls, seed_hex: str, ss58_format: Optional[int] = 42, address_type=None, crypto_type=KeypairType.SR25519
+            cls, seed_hex: str, ss58_format: Optional[int] = 42, crypto_type=KeypairType.SR25519
     ) -> 'Keypair':
         """
         Create a Keypair for given seed
@@ -179,7 +212,6 @@ class Keypair:
         ----------
         seed_hex: hex string of seed
         ss58_format: Substrate address format
-        address_type: (deprecated)
         crypto_type: Use KeypairType.SR25519 or KeypairType.ED25519 cryptography for generating the Keypair
 
         Returns
@@ -187,14 +219,10 @@ class Keypair:
         Keypair
         """
 
-        if address_type is not None:
-            warnings.warn("Keyword 'address_type' will be replaced by 'ss58_format'", DeprecationWarning)
-            ss58_format = address_type
-
         if crypto_type == KeypairType.SR25519:
             public_key, private_key = sr25519.pair_from_seed(bytes.fromhex(seed_hex.replace('0x', '')))
         elif crypto_type == KeypairType.ED25519:
-            private_key, public_key = ed25519.ed_from_seed(bytes.fromhex(seed_hex.replace('0x', '')))
+            private_key, public_key = ed25519_dalek.ed_from_seed(bytes.fromhex(seed_hex.replace('0x', '')))
         else:
             raise ValueError('crypto_type "{}" not supported'.format(crypto_type))
 
@@ -210,26 +238,22 @@ class Keypair:
 
     @classmethod
     def create_from_uri(
-            cls, suri: str, ss58_format: Optional[int] = 42, address_type=None, crypto_type=KeypairType.SR25519
+            cls, suri: str, ss58_format: Optional[int] = 42, crypto_type=KeypairType.SR25519, language_code: str = MnemonicLanguageCode.ENGLISH
     ) -> 'Keypair':
         """
-        Creates Keypair for specified suri in following format: `<mnemonic>/<soft-path>//<hard-path>`
+        Creates Keypair for specified suri in following format: `[mnemonic]/[soft-path]//[hard-path]`
 
         Parameters
         ----------
         suri:
         ss58_format: Substrate address format
-        address_type: (deprecated)
         crypto_type: Use KeypairType.SR25519 or KeypairType.ED25519 cryptography for generating the Keypair
+        language_code: The language to use, valid values are: 'en', 'zh-hans', 'zh-hant', 'fr', 'it', 'ja', 'ko', 'es'. Defaults to `MnemonicLanguageCode.ENGLISH`
 
         Returns
         -------
         Keypair
         """
-
-        if address_type is not None:
-            warnings.warn("Keyword 'address_type' will be replaced by 'ss58_format'", DeprecationWarning)
-            ss58_format = address_type
 
         if suri and suri.startswith('/'):
             suri = DEV_PHRASE + suri
@@ -238,50 +262,62 @@ class Keypair:
 
         suri_parts = suri_regex.groupdict()
 
-        if suri_parts['password']:
-            raise NotImplementedError("Passwords in suri not supported")
+        if crypto_type == KeypairType.ECDSA:
+            if language_code != MnemonicLanguageCode.ENGLISH:
+                raise ValueError("ECDSA mnemonic only supports english")
 
-        derived_keypair = cls.create_from_mnemonic(
-            suri_parts['phrase'], ss58_format=ss58_format, crypto_type=crypto_type
-        )
+            private_key = mnemonic_to_ecdsa_private_key(
+                mnemonic=suri_parts['phrase'],
+                str_derivation_path=suri_parts['path'][1:],
+                passphrase=suri_parts['password'] or ''
+            )
+            derived_keypair = cls.create_from_private_key(private_key, ss58_format=ss58_format, crypto_type=crypto_type)
+        else:
 
-        if suri_parts['path'] != '':
+            if suri_parts['password']:
+                raise NotImplementedError(f"Passwords in suri not supported for crypto_type '{crypto_type}'")
 
-            derived_keypair.derive_path = suri_parts['path']
+            derived_keypair = cls.create_from_mnemonic(
+                suri_parts['phrase'], ss58_format=ss58_format, crypto_type=crypto_type, language_code=language_code
+            )
 
-            if crypto_type not in [KeypairType.SR25519]:
-                raise NotImplementedError('Derivation paths for this crypto type not supported')
+            if suri_parts['path'] != '':
 
-            derive_junctions = extract_derive_path(suri_parts['path'])
+                derived_keypair.derive_path = suri_parts['path']
 
-            child_pubkey = bytes.fromhex(derived_keypair.public_key[2:])
-            child_privkey = bytes.fromhex(derived_keypair.private_key[2:])
+                if crypto_type not in [KeypairType.SR25519]:
+                    raise NotImplementedError('Derivation paths for this crypto type not supported')
 
-            for junction in derive_junctions:
+                derive_junctions = extract_derive_path(suri_parts['path'])
 
-                if junction.is_hard:
+                child_pubkey = derived_keypair.public_key
+                child_privkey = derived_keypair.private_key
 
-                    _, child_pubkey, child_privkey = sr25519.hard_derive_keypair(
-                        (junction.chain_code, child_pubkey, child_privkey),
-                        b''
-                    )
+                for junction in derive_junctions:
 
-                else:
+                    if junction.is_hard:
 
-                    _, child_pubkey, child_privkey = sr25519.derive_keypair(
-                        (junction.chain_code, child_pubkey, child_privkey),
-                        b''
-                    )
+                        _, child_pubkey, child_privkey = sr25519.hard_derive_keypair(
+                            (junction.chain_code, child_pubkey, child_privkey),
+                            b''
+                        )
 
-            derived_keypair = Keypair(public_key=child_pubkey, private_key=child_privkey, ss58_format=ss58_format)
+                    else:
+
+                        _, child_pubkey, child_privkey = sr25519.derive_keypair(
+                            (junction.chain_code, child_pubkey, child_privkey),
+                            b''
+                        )
+
+                derived_keypair = Keypair(public_key=child_pubkey, private_key=child_privkey, ss58_format=ss58_format)
 
         return derived_keypair
 
     @classmethod
     def create_from_private_key(
-            cls, private_key, public_key=None, ss58_address=None, ss58_format=None, crypto_type=KeypairType.SR25519,
-            address_type=None
-    ):
+            cls, private_key: Union[bytes, str], public_key: bytes = None, ss58_address: str = None,
+            ss58_format: int = None, crypto_type=KeypairType.SR25519
+    ) -> 'Keypair':
         """
         Creates Keypair for specified public/private keys
         Parameters
@@ -290,23 +326,19 @@ class Keypair:
         public_key: hex string or bytes of public key
         ss58_address: Substrate address
         ss58_format: Substrate address format, default = 42
-        address_type: (deprecated)
         crypto_type: Use KeypairType.SR25519 or KeypairType.ED25519 cryptography for generating the Keypair
 
         Returns
         -------
         Keypair
         """
-        if address_type is not None:
-            warnings.warn("Keyword 'address_type' will be replaced by 'ss58_format'", DeprecationWarning)
-            ss58_format = address_type
 
         return cls(
             ss58_address=ss58_address, public_key=public_key, private_key=private_key,
             ss58_format=ss58_format, crypto_type=crypto_type
         )
 
-    def sign(self, data):
+    def sign(self, data: Union[ScaleBytes, bytes, str]) -> bytes:
         """
         Creates a signature for given data
 
@@ -330,16 +362,20 @@ class Keypair:
             raise ConfigurationError('No private key set to create signatures')
 
         if self.crypto_type == KeypairType.SR25519:
+            signature = sr25519.sign((self.public_key, self.private_key), data)
 
-            signature = sr25519.sign((bytes.fromhex(self.public_key[2:]), bytes.fromhex(self.private_key[2:])), data)
         elif self.crypto_type == KeypairType.ED25519:
-            signature = ed25519.ed_sign(bytes.fromhex(self.public_key[2:]), bytes.fromhex(self.private_key[2:]), data)
+            signature = ed25519_dalek.ed_sign(self.public_key, self.private_key, data)
+
+        elif self.crypto_type == KeypairType.ECDSA:
+            signature = ecdsa_sign(self.private_key, data)
+
         else:
             raise ConfigurationError("Crypto type not supported")
 
-        return "0x{}".format(signature.hex())
+        return signature
 
-    def verify(self, data, signature):
+    def verify(self, data: Union[ScaleBytes, bytes, str], signature: Union[bytes, str]) -> bool:
         """
         Verifies data with specified signature
 
@@ -367,20 +403,35 @@ class Keypair:
             raise TypeError("Signature should be of type bytes or a hex-string")
 
         if self.crypto_type == KeypairType.SR25519:
-            return sr25519.verify(signature, data, bytes.fromhex(self.public_key[2:]))
+            crypto_verify_fn = sr25519.verify
         elif self.crypto_type == KeypairType.ED25519:
-            return ed25519.ed_verify(signature, data, bytes.fromhex(self.public_key[2:]))
+            crypto_verify_fn = ed25519_dalek.ed_verify
+        elif self.crypto_type == KeypairType.ECDSA:
+            crypto_verify_fn = ecdsa_verify
         else:
             raise ConfigurationError("Crypto type not supported")
 
+        verified = crypto_verify_fn(signature, data, self.public_key)
+
+        if not verified:
+            # Another attempt with the data wrapped, as discussed in https://github.com/polkadot-js/extension/pull/743
+            # Note: As Python apps are trusted sources on its own, no need to wrap data when signing from this lib
+            verified = crypto_verify_fn(signature, b'<Bytes>' + data + b'</Bytes>', self.public_key)
+
+        return verified
+
     def __repr__(self):
-        return '<Keypair (ss58_address={})>'.format(self.ss58_address)
+        if self.ss58_address:
+            return '<Keypair (address={})>'.format(self.ss58_address)
+        else:
+            return '<Keypair (public_key=0x{})>'.format(self.public_key.hex())
 
 
 class SubstrateInterface:
 
     def __init__(self, url=None, websocket=None, ss58_format=None, type_registry=None, type_registry_preset=None,
-                 cache_region=None, address_type=None, runtime_config=None, use_remote_preset=False):
+                 cache_region=None, runtime_config=None, use_remote_preset=False, ws_options=None,
+                 auto_discover=True, auto_reconnect=True):
         """
         A specialized class in interfacing with a Substrate node.
 
@@ -392,14 +443,11 @@ class SubstrateInterface:
         type_registry_preset: The name of the predefined type registry shipped with the SCALE-codec, e.g. kusama
         cache_region: a Dogpile cache region as a central store for the metadata cache
         use_remote_preset: When True preset is downloaded from Github master, otherwise use files from local installed scalecodec package
+        ws_options: dict of options to pass to the websocket-client create_connection function
         """
 
         if (not url and not websocket) or (url and websocket):
             raise ValueError("Either 'url' or 'websocket' must be provided")
-
-        if address_type is not None:
-            warnings.warn("Keyword 'address_type' will be replaced by 'ss58_format'", DeprecationWarning)
-            ss58_format = address_type
 
         # Initialize lazy loading variables
         self.__version = None
@@ -411,15 +459,34 @@ class SubstrateInterface:
         self.__token_symbol = None
         self.__ss58_format = None
 
+        if not runtime_config:
+            runtime_config = RuntimeConfigurationObject()
+
+        self.runtime_config = runtime_config
+
         self.cache_region = cache_region
 
-        self.ss58_format = ss58_format
+        if ss58_format is not None:
+            self.ss58_format = ss58_format
+
         self.type_registry_preset = type_registry_preset
         self.type_registry = type_registry
 
         self.request_id = 1
         self.url = url
         self.websocket = None
+
+        # Websocket connection options
+        self.ws_options = ws_options or {}
+
+        if 'max_size' not in self.ws_options:
+            self.ws_options['max_size'] = 2 ** 32
+
+        if 'read_limit' not in self.ws_options:
+            self.ws_options['read_limit'] = 2 ** 32
+
+        if 'write_limit' not in self.ws_options:
+            self.ws_options['write_limit'] = 2 ** 32
 
         self.__rpc_message_queue = []
 
@@ -446,23 +513,25 @@ class SubstrateInterface:
         self.metadata_cache = {}
         self.type_registry_cache = {}
 
-        if not runtime_config:
-            runtime_config = RuntimeConfigurationObject(ss58_format=self.ss58_format)
-
-        self.runtime_config = runtime_config
-
         self.debug = False
 
-        self.reload_type_registry(use_remote_preset=use_remote_preset)
+        self.config = {
+            'use_remote_preset': use_remote_preset,
+            'auto_discover': auto_discover,
+            'auto_reconnect': auto_reconnect
+        }
+
+        self.session = requests.Session()
+
+        self.reload_type_registry(use_remote_preset=use_remote_preset, auto_discover=auto_discover)
 
     def connect_websocket(self):
+
         if self.url and (self.url[0:6] == 'wss://' or self.url[0:5] == 'ws://'):
             self.debug_message("Connecting to {} ...".format(self.url))
             self.websocket = create_connection(
                 self.url,
-                max_size=2 ** 32,
-                read_limit=2 ** 32,
-                write_limit=2 ** 32,
+                **self.ws_options
             )
 
     def close(self):
@@ -510,52 +579,8 @@ class SubstrateInterface:
         if self.websocket:
             try:
                 self.websocket.send(json.dumps(payload))
-
-                update_nr = 0
-                json_body = None
-                subscription_id = None
-
-                while json_body is None:
-
-                    self.__rpc_message_queue.append(json.loads(self.websocket.recv()))
-
-                    for message in self.__rpc_message_queue:
-
-                        # Check if result message is matching request ID
-                        if 'id' in message and message['id'] == request_id:
-
-                            self.__rpc_message_queue.remove(message)
-
-                            # Check if response has error
-                            if 'error' in message:
-                                raise SubstrateRequestException(message['error'])
-
-                            # If result handler is set, pass result through and loop until handler return value is set
-                            if callable(result_handler):
-
-                                # Set subscription ID and only listen to messages containing this ID
-                                subscription_id = message['result']
-                                self.debug_message(f"Websocket subscription [{subscription_id}] created")
-
-                            else:
-                                json_body = message
-
-                        # Check if message is meant for this subscription
-                        elif 'params' in message and message['params']['subscription'] == subscription_id:
-
-                            self.__rpc_message_queue.remove(message)
-
-                            self.debug_message(f"Websocket result [{subscription_id} #{update_nr}]: {message}")
-
-                            # Call result_handler with message for processing
-                            callback_result = result_handler(message, update_nr, subscription_id)
-                            if callback_result is not None:
-                                json_body = callback_result
-
-                            update_nr += 1
-
             except WebSocketConnectionClosedException:
-                if self.url:
+                if self.config.get('auto_reconnect') and self.url:
                     # Try to reconnect websocket and retry rpc_request
                     self.debug_message("Connection Closed; Trying to reconnecting...")
                     self.connect_websocket()
@@ -565,12 +590,58 @@ class SubstrateInterface:
                     # websocket connection is externally created, re-raise exception
                     raise
 
+            update_nr = 0
+            json_body = None
+            subscription_id = None
+
+            while json_body is None:
+
+                self.__rpc_message_queue.append(json.loads(self.websocket.recv()))
+
+                # Search for subscriptions
+                for message in self.__rpc_message_queue:
+
+                    # Check if result message is matching request ID
+                    if 'id' in message and message['id'] == request_id:
+
+                        self.__rpc_message_queue.remove(message)
+
+                        # Check if response has error
+                        if 'error' in message:
+                            raise SubstrateRequestException(message['error'])
+
+                        # If result handler is set, pass result through and loop until handler return value is set
+                        if callable(result_handler):
+
+                            # Set subscription ID and only listen to messages containing this ID
+                            subscription_id = message['result']
+                            self.debug_message(f"Websocket subscription [{subscription_id}] created")
+
+                        else:
+                            json_body = message
+
+                # Process subscription updates
+                for message in self.__rpc_message_queue:
+                    # Check if message is meant for this subscription
+                    if 'params' in message and message['params']['subscription'] == subscription_id:
+
+                        self.__rpc_message_queue.remove(message)
+
+                        self.debug_message(f"Websocket result [{subscription_id} #{update_nr}]: {message}")
+
+                        # Call result_handler with message for processing
+                        callback_result = result_handler(message, update_nr, subscription_id)
+                        if callback_result is not None:
+                            json_body = callback_result
+
+                        update_nr += 1
+
         else:
 
             if result_handler:
                 raise ConfigurationError("Result handlers only available for websockets (ws://) connections")
 
-            response = requests.request("POST", self.url, data=json.dumps(payload), headers=self.default_headers)
+            response = self.session.request("POST", self.url, data=json.dumps(payload), headers=self.default_headers)
 
             if response.status_code != 200:
                 raise SubstrateRequestException(
@@ -637,7 +708,11 @@ class SubstrateInterface:
     def ss58_format(self):
         if self.__ss58_format is None:
             if self.properties:
-                self.__ss58_format = self.properties.get('ss58Format')
+
+                if self.properties.get('ss58Format') is not None:
+                    self.__ss58_format = self.properties.get('ss58Format')
+                elif self.properties.get('SS58Prefix') is not None:
+                    self.__ss58_format = self.properties.get('SS58Prefix')
             else:
                 self.__ss58_format = 42
         return self.__ss58_format
@@ -647,6 +722,13 @@ class SubstrateInterface:
         if type(value) is not int and value is not None:
             raise TypeError('ss58_format must be an int')
         self.__ss58_format = value
+
+        if self.runtime_config:
+            self.runtime_config.ss58_format = value
+
+    def implements_scaleinfo(self) -> Optional[bool]:
+        if self.metadata_decoder:
+            return self.metadata_decoder.portable_registry is not None
 
     def get_chain_head(self):
         """
@@ -682,7 +764,7 @@ class SubstrateInterface:
 
     def get_chain_block(self, block_hash=None, block_id=None, metadata_decoder=None):
         """
-        A pass-though to existing JSONRPC method `chain_getBlock`. For a decoded version see `get_runtime_block()`
+        A pass-though to existing JSONRPC method `chain_getBlock`. For a decoded version see `get_block()`
 
         Parameters
         ----------
@@ -716,7 +798,7 @@ class SubstrateInterface:
                 result['block']['header']['number'] = int(result['block']['header']['number'], 16)
 
                 for idx, extrinsic_data in enumerate(result['block']['extrinsics']):
-                    extrinsic_decoder = ExtrinsicsDecoder(
+                    extrinsic_decoder = Extrinsic(
                         data=ScaleBytes(extrinsic_data),
                         metadata=metadata_decoder,
                         runtime_config=self.runtime_config
@@ -725,13 +807,14 @@ class SubstrateInterface:
                     result['block']['extrinsics'][idx] = extrinsic_decoder.value
 
                 for idx, log_data in enumerate(result['block']['header']["digest"]["logs"]):
-                    log_digest = LogDigest(ScaleBytes(log_data), runtime_config=self.runtime_config)
+                    log_digest = self.runtime_config.create_scale_object(
+                        'sp_runtime::generic::digest::DigestItem', ScaleBytes(log_data)
+                    )
                     log_digest.decode()
                     result['block']['header']["digest"]["logs"][idx] = log_digest.value
 
             return result
 
-    @lru_cache(maxsize=1000)
     def get_block_hash(self, block_id: int) -> str:
         """
         A pass-though to existing JSONRPC method `chain_getBlockHash`
@@ -751,7 +834,6 @@ class SubstrateInterface:
         else:
             return response.get('result')
 
-    @block_dependent_lru_cache(maxsize=1000, block_arg_index=1)
     def get_block_number(self, block_hash: str) -> int:
         """
         A convenience method to get the block number for given block_hash
@@ -774,15 +856,14 @@ class SubstrateInterface:
             if response['result']:
                 return int(response['result']['number'], 16)
 
-    @block_dependent_lru_cache(maxsize=10)
     def get_block_metadata(self, block_hash=None, decode=True):
         """
-        A pass-though to existing JSONRPC method `state_getMetadata`. For a decoded version see `get_runtime_metadata()`
+        A pass-though to existing JSONRPC method `state_getMetadata`.
 
         Parameters
         ----------
         block_hash
-        decode: DEPRECATED use `get_runtime_metadata()` for decoded version
+        decode: True for decoded version
 
         Returns
         -------
@@ -797,61 +878,14 @@ class SubstrateInterface:
             raise SubstrateRequestException(response['error']['message'])
 
         if response.get('result') and decode:
-            metadata_decoder = MetadataDecoder(ScaleBytes(response.get('result')), runtime_config=self.runtime_config)
+            metadata_decoder = self.runtime_config.create_scale_object(
+                'MetadataVersioned', data=ScaleBytes(response.get('result'))
+            )
             metadata_decoder.decode()
 
             return metadata_decoder
 
         return response
-
-    def get_storage(self, block_hash, module, function, params=None, return_scale_type=None, hasher=None,
-                    spec_version_id='default', metadata=None, metadata_version=None):
-        """
-        Retrieves the storage entry for given module, function and optional parameters at given block.
-
-        DEPRECATED: use `query()`
-
-        Parameters
-        ----------
-        block_hash
-        module
-        function
-        params
-        return_scale_type: Scale type string to interprete result
-        hasher: Hashing method used to determine storage key, defaults to 'Twox64Concat' if not provided
-        spec_version_id: DEPRECATED
-        metadata
-        metadata_version: Version index of Metadata, e.g. 9 for MetadataV9
-
-        Returns
-        -------
-
-        """
-        storage_hash = self.generate_storage_hash(
-            storage_module=module,
-            storage_function=function,
-            params=params,
-            hashers=[hasher]
-        )
-        response = self.rpc_request("state_getStorageAt", [storage_hash, block_hash])
-
-        if 'error' in response:
-            raise SubstrateRequestException(response['error']['message'])
-
-        elif 'result' in response:
-
-            if return_scale_type and response.get('result'):
-                obj = ScaleDecoder.get_decoder_class(
-                    type_string=return_scale_type,
-                    data=ScaleBytes(response.get('result')),
-                    metadata=metadata,
-                    runtime_config=self.runtime_config
-                )
-                return obj.decode()
-            else:
-                return response.get('result')
-        else:
-            raise SubstrateRequestException("Error occurred during retrieval of events")
 
     def get_storage_by_key(self, block_hash, storage_key):
         """
@@ -875,6 +909,7 @@ class SubstrateInterface:
         else:
             raise SubstrateRequestException("Unknown error occurred during retrieval of events")
 
+<<<<<<< HEAD
     def get_block_events(self, block_hash, metadata_decoder=None):
         """
         A convenience method to fetch the undecoded events from storage
@@ -924,6 +959,8 @@ class SubstrateInterface:
         else:
             raise SubstrateRequestException("Error occurred during retrieval of events")
 
+=======
+>>>>>>> upstream/master
     def get_block_runtime_version(self, block_hash):
         """
         Retrieve the runtime version id of given block_hash
@@ -1007,6 +1044,10 @@ class SubstrateInterface:
         return '0x{}'.format(storage_hash)
 
     def convert_storage_parameter(self, scale_type, value):
+
+        if type(value) is bytes:
+            value = f'0x{value.hex()}'
+
         if scale_type == 'AccountId':
             if value[0:2] != '0x':
                 return '0x{}'.format(ss58_decode(value, self.ss58_format))
@@ -1076,9 +1117,6 @@ class SubstrateInterface:
         self.runtime_version = runtime_info.get("specVersion")
         self.transaction_version = runtime_info.get("transactionVersion")
 
-        # Set active runtime version
-        self.runtime_config.set_active_spec_version_id(self.runtime_version)
-
         if self.runtime_version not in self.metadata_cache and self.cache_region:
             # Try to retrieve metadata from Dogpile cache
             cached_metadata = self.cache_region.get('METADATA_{}'.format(self.runtime_version))
@@ -1101,76 +1139,25 @@ class SubstrateInterface:
                 self.debug_message('Stored metadata for {} in Redis'.format(self.runtime_version))
                 self.cache_region.set('METADATA_{}'.format(self.runtime_version), self.metadata_decoder)
 
-    def iterate_map(self, module, storage_function, block_hash=None):
-        """
-        iterates over all key-pairs located at the given module and storage_function. The storage
-        item must be a map.
-
-        Parameters
-        ----------
-        module: The module name in the metadata, e.g. Balances or Account.
-        storage_function: The storage function name, e.g. FreeBalance or AccountNonce.
-        block_hash: Optional block hash, when left to None the chain tip will be used.
-
-        Returns
-        -------
-        A two dimensional list of key-value pairs, both decoded into the given type, e.g.
-        [[k1, v1], [k2, v2], ...]
-        """
-        warnings.warn("'iterate_map' will be replaced by 'query_map'", DeprecationWarning)
-
-        if block_hash is None:
-            # Retrieve chain tip
-            block_hash = self.get_chain_head()
-
-        self.init_runtime(block_hash=block_hash)
-
-        key_type = None
-        value_type = None
-        concat_hash_len = None
-
-        storage_item = self.get_metadata_storage_function(module, storage_function, block_hash=block_hash)
-        storage_module = self.get_metadata_module(module)
-
-        if not storage_item or not storage_module:
-            raise ValueError(f'Specified storage function "{module}.{storage_function}" not found in metadata')
-
-        if 'MapType' in storage_item.type:
-            key_type = storage_item.type['MapType']['key']
-            value_type = storage_item.type['MapType']['value']
-            if storage_item.type['MapType']['hasher'] == "Blake2_128Concat":
-                concat_hash_len = 32
-            elif storage_item.type['MapType']['hasher'] == "Twox64Concat":
-                concat_hash_len = 16
-            elif storage_item.type['MapType']['hasher'] == "Identity":
-                concat_hash_len = 0
-            else:
-                raise ValueError('Unsupported hash type')
-        else:
-            raise ValueError('Given storage is not a map')
-
-        prefix = self.generate_storage_hash(storage_module.prefix, storage_item.name)
-        prefix_len = len(prefix)
-        response = self.rpc_request(method="state_getPairs", params=[prefix, block_hash])
-
-        if 'error' in response:
-            raise SubstrateRequestException(response['error']['message'])
-
-        pairs = response.get('result')
-
-        # convert keys to the portion that needs to be decoded.
-        pairs = map(lambda kp: ["0x" + kp[0][prefix_len + concat_hash_len:], kp[1]], pairs)
-
-        # decode both of them
-        pairs = map(
-            lambda kp: [
-                self.decode_scale(key_type, kp[0], block_hash=block_hash),
-                self.decode_scale(value_type, kp[1], block_hash=block_hash)
-            ],
-            list(pairs)
+        # Update type registry
+        self.reload_type_registry(
+            use_remote_preset=self.config.get('use_remote_preset'),
+            auto_discover=self.config.get('auto_discover')
         )
 
-        return list(pairs)
+        # Check if PortableRegistry is present in metadata (V14+), otherwise fall back on legacy type registry (<V14)
+        if self.implements_scaleinfo():
+            self.debug_message('Add PortableRegistry from metadata to type registry')
+            self.runtime_config.add_portable_registry(self.metadata_decoder)
+
+        # Set active runtime version
+        self.runtime_config.set_active_spec_version_id(self.runtime_version)
+
+        # Check and apply runtime constants
+        ss58_prefix_constant = self.get_constant("System", "SS58Prefix", block_hash=block_hash)
+
+        if ss58_prefix_constant:
+            self.ss58_format = ss58_prefix_constant.value
 
     def query_map(self, module: str, storage_function: str, params: Optional[list] = None, block_hash: str = None,
                   max_results: int = None, start_key: str = None, page_size: int = 100,
@@ -1208,6 +1195,9 @@ class SubstrateInterface:
             # Retrieve chain tip
             block_hash = self.get_chain_head()
 
+        if params is None:
+            params = []
+
         self.init_runtime(block_hash=block_hash)
 
         # Retrieve storage module and function from metadata
@@ -1217,53 +1207,30 @@ class SubstrateInterface:
         if not storage_module or not storage_item:
             raise StorageFunctionNotFound('Storage function "{}.{}" not found'.format(module, storage_function))
 
-        # Check MapType condititions and determine prefix length
-        if 'MapType' in storage_item.type:
+        value_type = storage_item.get_value_type_string()
+        param_types = storage_item.get_params_type_string()
+        key_hashers = storage_item.get_param_hashers()
 
-            if params:
-                raise ValueError('"params" is only used with a DoubleMap storage function')
-
-            params = []
-
-            param_types = [storage_item.type['MapType']['key']]
-            key_hashers = [storage_item.type['MapType']['hasher']]
-
-            value_type = storage_item.type['MapType']['value']
-
-        elif 'DoubleMapType' in storage_item.type:
-
-            if params is None or len(params) != 1:
-                raise ValueError('"params" with 1 element is mandatory with a DoubleMap storage function')
-
-            param_types = [storage_item.type['DoubleMapType']['key1'], storage_item.type['DoubleMapType']['key2']]
-            value_type = storage_item.type['DoubleMapType']['value']
-            key_hashers = [storage_item.type['DoubleMapType']['hasher'], storage_item.type['DoubleMapType']['key2Hasher']]
-
-        elif 'NMapType' in storage_item.type:
-
-            param_types = storage_item.type['NMapType']['keys']
-            value_type = storage_item.type['NMapType']['value']
-            key_hashers = storage_item.type['NMapType']['hashers']
-
-            if params is None or len(params) != len(param_types) - 1:
-                raise ValueError(f'{len(param_types) - 1} length params is mandatory with this storage function')
-
-        else:
+        # Check MapType condititions
+        if len(param_types) == 0:
             raise ValueError('Given storage function is not a map')
+
+        if len(params) != len(param_types) - 1:
+            raise ValueError(f'Storage function map requires {len(param_types) -1} parameters, {len(params)} given')
 
         # Encode parameters
         for idx, param in enumerate(params):
             if type(param) is not ScaleBytes:
                 param = self.convert_storage_parameter(param_types[idx], param)
-                param_obj = ScaleDecoder.get_decoder_class(
-                    type_string=param_types[idx], runtime_config=self.runtime_config
-                )
+                param_obj = self.runtime_config.create_scale_object(type_string=param_types[idx])
                 params[idx] = param_obj.encode(param)
 
         # Generate storage key prefix
         prefix = self.generate_storage_hash(
-            storage_module=storage_module.prefix, storage_function=storage_item.name,
-            params=params, hashers=key_hashers
+            storage_module=storage_module.value['storage']['prefix'],
+            storage_function=storage_item.value['name'],
+            params=params,
+            hashers=key_hashers
         )
 
         if not start_key:
@@ -1339,7 +1306,7 @@ class SubstrateInterface:
         )
 
     def query(self, module: str, storage_function: str, params: list = None, block_hash: str = None,
-              subscription_handler: callable = None) -> Optional[ScaleType]:
+              subscription_handler: callable = None, raw_storage_key: bytes = None) -> Optional[ScaleType]:
         """
         Retrieves the storage entry for given module, function and optional parameters at given block hash.
 
@@ -1369,6 +1336,7 @@ class SubstrateInterface:
         params: list of params, in the decoded format of the applicable ScaleTypes
         block_hash: Optional block hash, when omitted the chain tip will be used
         subscription_handler: Callback function that processes the updates of the storage query subscription
+        raw_storage_key: Optional raw storage key to query decode instead of generating one
 
         Returns
         -------
@@ -1388,6 +1356,10 @@ class SubstrateInterface:
 
         self.init_runtime(block_hash=block_hash)
 
+        if module == 'Substrate':
+            # Search for 'well-known' storage keys
+            return self.__query_well_known(storage_function, block_hash)
+
         # Search storage call in metadata
         metadata_module = self.get_metadata_module(module, block_hash=block_hash)
         storage_item = self.get_metadata_storage_function(module, storage_function, block_hash=block_hash)
@@ -1396,72 +1368,56 @@ class SubstrateInterface:
             raise StorageFunctionNotFound('Storage function "{}.{}" not found'.format(module, storage_function))
 
         # Process specific type of storage function
-        if 'PlainType' in storage_item.type:
-            hashers = ['Twox64Concat']
-            param_types = []
-            return_scale_type = storage_item.type.get('PlainType')
+        value_scale_type = storage_item.get_value_type_string()
+        param_types = storage_item.get_params_type_string()
+        hashers = storage_item.get_param_hashers()
 
-            if len(params) != 0:
-                raise ValueError('Storage call of type "PlainType" doesn\'t accept params')
-
-        elif 'MapType' in storage_item.type:
-
-            map_type = storage_item.type.get('MapType')
-            hashers = [map_type.get('hasher')]
-            param_types = [map_type['key']]
-            return_scale_type = map_type.get('value')
-
-            if len(params) != 1:
-                raise ValueError('Storage call of type "MapType" requires 1 parameter')
-
-        elif 'DoubleMapType' in storage_item.type:
-
-            map_type = storage_item.type.get('DoubleMapType')
-            hashers = [map_type.get('hasher'), map_type.get('key2Hasher')]
-            param_types = [map_type['key1'], map_type['key2']]
-            return_scale_type = map_type.get('value')
-
-            if len(params) != 2:
-                raise ValueError('Storage call of type "DoubleMapType" requires 2 parameters')
-
-        elif 'NMapType' in storage_item.type:
-
-            map_type = storage_item.type.get('NMapType')
-            hashers = map_type.get('hashers')
-            param_types = map_type.get('keys')
-            return_scale_type = map_type.get('value')
-
+        if raw_storage_key:
+            storage_hash = f'0x{raw_storage_key.hex()}'
         else:
-            raise NotImplementedError("Storage type not implemented")
+            if len(params) != len(param_types):
+                raise ValueError(f'Storage function requires {len(param_types)} parameters, {len(params)} given')
 
-        # Encode parameters
-        for idx, param in enumerate(params):
-            param = self.convert_storage_parameter(param_types[idx], param)
-            param_obj = ScaleDecoder.get_decoder_class(
-                type_string=param_types[idx], runtime_config=self.runtime_config
+            # Encode parameters
+            for idx, param in enumerate(params):
+                param = self.convert_storage_parameter(param_types[idx], param)
+                param_obj = self.runtime_config.create_scale_object(type_string=param_types[idx])
+                params[idx] = param_obj.encode(param)
+
+            storage_hash = self.generate_storage_hash(
+                storage_module=metadata_module.value['storage']['prefix'],
+                storage_function=storage_function,
+                params=params,
+                hashers=hashers
             )
-            params[idx] = param_obj.encode(param)
-
-        storage_hash = self.generate_storage_hash(
-            storage_module=metadata_module.prefix,
-            storage_function=storage_function,
-            params=params,
-            hashers=hashers
-        )
 
         def result_handler(message, update_nr, subscription_id):
-            if return_scale_type:
+            if value_scale_type:
 
                 for change_storage_key, change_data in message['params']['result']['changes']:
                     if change_storage_key == storage_hash:
+                        result_found = False
 
-                        updated_obj = ScaleDecoder.get_decoder_class(
-                            type_string=return_scale_type,
+                        if change_data is not None:
+                            change_scale_type = value_scale_type
+                            result_found = True
+                        elif storage_item.value['modifier'] == 'Default':
+                            # Fallback to default value of storage function if no result
+                            change_scale_type = value_scale_type
+                            change_data = storage_item.value_object['default'].value_object
+                        else:
+                            # No result is interpreted as an Option<...> result
+                            change_scale_type = f'Option<{value_scale_type}>'
+                            change_data = storage_item.value_object['default'].value_object
+
+                        updated_obj = self.runtime_config.create_scale_object(
+                            type_string=change_scale_type,
                             data=ScaleBytes(change_data),
-                            metadata=self.metadata_decoder,
-                            runtime_config=self.runtime_config
+                            metadata=self.metadata_decoder
                         )
                         updated_obj.decode()
+                        updated_obj.meta_info = {'result_found': result_found}
+
                         subscription_result = subscription_handler(updated_obj, update_nr, subscription_id)
 
                         if subscription_result is not None:
@@ -1472,9 +1428,7 @@ class SubstrateInterface:
 
         if callable(subscription_handler):
 
-            result = self.rpc_request("state_subscribeStorage", [[storage_hash]], result_handler=result_handler)
-
-            return result
+            return self.rpc_request("state_subscribeStorage", [[storage_hash]], result_handler=result_handler)
 
         else:
 
@@ -1484,30 +1438,65 @@ class SubstrateInterface:
                 raise SubstrateRequestException(response['error']['message'])
 
             if 'result' in response:
-                if return_scale_type:
+                if value_scale_type:
 
                     if response.get('result') is not None:
                         query_value = response.get('result')
-                    elif storage_item.modifier == 'Default':
+                    elif storage_item.value['modifier'] == 'Default':
                         # Fallback to default value of storage function if no result
-                        query_value = storage_item.fallback
+                        query_value = storage_item.value_object['default'].value_object
                     else:
                         # No result is interpreted as an Option<...> result
-                        return_scale_type = f'Option<{return_scale_type}>'
-                        query_value = storage_item.fallback
+                        value_scale_type = f'Option<{value_scale_type}>'
+                        query_value = storage_item.value_object['default'].value_object
 
-                    obj = ScaleDecoder.get_decoder_class(
-                        type_string=return_scale_type,
+                    obj = self.runtime_config.create_scale_object(
+                        type_string=value_scale_type,
                         data=ScaleBytes(query_value),
-                        metadata=self.metadata_decoder,
-                        runtime_config=self.runtime_config
+                        metadata=self.metadata_decoder
                     )
                     obj.decode()
+                    obj.meta_info = {'result_found': response.get('result') is not None}
+
                     return obj
 
         return None
 
+    def __query_well_known(self, name: str, block_hash: str) -> Optional[ScaleType]:
+        """
+        Query well-known storage keys as defined in Substrate
+
+        Parameters
+        ----------
+        name
+        block_hash
+
+        Returns
+        -------
+        Optional[ScaleType]
+        """
+        if name not in WELL_KNOWN_STORAGE_KEYS:
+            raise StorageFunctionNotFound(f'Well known storage key for "{name}" not found')
+
+        result = self.get_storage_by_key(block_hash, WELL_KNOWN_STORAGE_KEYS[name]['storage_key'])
+        obj = self.runtime_config.create_scale_object(
+            WELL_KNOWN_STORAGE_KEYS[name]['value_type_string']
+        )
+        if result:
+            obj.decode(ScaleBytes(result))
+            obj.meta_info = {'result_found': True}
+            return obj
+        elif WELL_KNOWN_STORAGE_KEYS[name]['default']:
+            obj.decode(ScaleBytes(WELL_KNOWN_STORAGE_KEYS[name]['default']))
+            obj.meta_info = {'result_found': False}
+            return obj
+        else:
+            return None
+
     def get_runtime_state(self, module, storage_function, params=None, block_hash=None):
+        """
+        Warning: 'get_runtime_state' will be replaced by 'query'
+        """
         warnings.warn("'get_runtime_state' will be replaced by 'query'", DeprecationWarning)
 
         obj = self.query(module, storage_function, params=params, block_hash=block_hash)
@@ -1537,10 +1526,8 @@ class SubstrateInterface:
 
     def get_runtime_events(self, block_hash=None):
 
-        warnings.warn("'get_runtime_events' will be replaced by 'get_events'", DeprecationWarning)
-
         """
-        Convenience method to get events for a certain block (storage call for module 'System' and function 'Events')
+        Warning: 'get_runtime_events' will be replaced by 'get_events'
 
         Parameters
         ----------
@@ -1550,6 +1537,8 @@ class SubstrateInterface:
         -------
         Collection of events
         """
+        warnings.warn("'get_runtime_events' will be replaced by 'get_events'", DeprecationWarning)
+
         return self.get_runtime_state(
             module="System",
             storage_function="Events",
@@ -1577,12 +1566,31 @@ class SubstrateInterface:
             raise SubstrateRequestException(response['error']['message'])
 
         if 'result' in response:
-            metadata_decoder = MetadataDecoder(ScaleBytes(response.get('result')), runtime_config=self.runtime_config)
+            metadata_decoder = self.runtime_config.create_scale_object(
+                'MetadataVersioned', data=ScaleBytes(response.get('result')))
             response['result'] = metadata_decoder.decode()
 
         return response
 
-    def compose_call(self, call_module, call_function, call_params=(), block_hash=None):
+    def create_scale_object(self, type_string: str, data=None, block_hash=None, **kwargs) -> 'ScaleType':
+        """
+        Convenience method to create a SCALE object of type `type_string`, this will initialize the runtime
+        automatically at moment of `block_hash`, or chain tip if omitted.
+
+        :param type_string:
+        :param data:
+        :param block_hash: Optional block hash for moment of decoding, when omitted the chain tip will be used
+        :param kwargs:
+        :return: ScaleType
+        """
+        self.init_runtime(block_hash=block_hash)
+
+        if 'metadata' not in kwargs:
+            kwargs['metadata'] = self.metadata_decoder
+
+        return self.runtime_config.create_scale_object(type_string, data=data, **kwargs)
+
+    def compose_call(self, call_module: str, call_function: str, call_params: dict = None, block_hash: str = None):
         """
         Composes a call payload which can be used as an unsigned extrinsic or a proposal.
 
@@ -1597,10 +1605,14 @@ class SubstrateInterface:
         -------
         GenericCall
         """
+
+        if call_params is None:
+            call_params = {}
+
         self.init_runtime(block_hash=block_hash)
 
-        call = ScaleDecoder.get_decoder_class(
-            type_string='Call', metadata=self.metadata_decoder, runtime_config=self.runtime_config
+        call = self.runtime_config.create_scale_object(
+            type_string='Call', metadata=self.metadata_decoder
         )
 
         call.encode({
@@ -1626,7 +1638,8 @@ class SubstrateInterface:
         response = self.rpc_request("system_accountNextIndex", [account_address])
         return response.get('result', 0)
 
-    def generate_signature_payload(self, call, era=None, nonce=0, tip=0, include_call_length=False) -> ScaleBytes:
+    def generate_signature_payload(self, call: GenericCall, era=None, nonce: int = 0, tip: int = 0,
+                                   tip_asset_id: int = None, include_call_length: bool = False) -> ScaleBytes:
 
         # Retrieve genesis hash
         genesis_hash = self.get_block_hash(0)
@@ -1639,7 +1652,7 @@ class SubstrateInterface:
             block_hash = genesis_hash
         else:
             # Determine mortality of extrinsic
-            era_obj = ScaleDecoder.get_decoder_class('Era', runtime_config=self.runtime_config)
+            era_obj = self.runtime_config.create_scale_object('Era')
 
             if isinstance(era, dict) and 'current' not in era and 'phase' not in era:
                 raise ValueError('The era dict must contain either "current" or "phase" element to encode a valid era')
@@ -1648,7 +1661,66 @@ class SubstrateInterface:
             block_hash = self.get_block_hash(block_id=era_obj.birth(era.get('current')))
 
         # Create signature payload
-        signature_payload = ScaleDecoder.get_decoder_class('ExtrinsicPayloadValue', runtime_config=self.runtime_config)
+        signature_payload = self.runtime_config.create_scale_object('ExtrinsicPayloadValue')
+
+        # Process signed extensions in metadata
+        if 'signed_extensions' in self.metadata_decoder[1][1]['extrinsic']:
+
+            # Base signature payload
+            signature_payload.type_mapping = [['call', 'CallBytes']]
+
+            # Add signed extensions to payload
+            signed_extensions = self.metadata_decoder.get_signed_extensions()
+
+            if 'CheckMortality' in signed_extensions:
+                signature_payload.type_mapping.append(
+                    ['era', signed_extensions['CheckMortality']['extrinsic']]
+                )
+
+            if 'CheckEra' in signed_extensions:
+                signature_payload.type_mapping.append(
+                    ['era', signed_extensions['CheckEra']['extrinsic']]
+                )
+
+            if 'CheckNonce' in signed_extensions:
+                signature_payload.type_mapping.append(
+                    ['nonce', signed_extensions['CheckNonce']['extrinsic']]
+                )
+
+            if 'ChargeTransactionPayment' in signed_extensions:
+                signature_payload.type_mapping.append(
+                    ['tip', signed_extensions['ChargeTransactionPayment']['extrinsic']]
+                )
+
+            if 'ChargeAssetTxPayment' in signed_extensions:
+                signature_payload.type_mapping.append(
+                    ['asset_id', signed_extensions['ChargeAssetTxPayment']['extrinsic']]
+                )
+
+            if 'CheckSpecVersion' in signed_extensions:
+                signature_payload.type_mapping.append(
+                    ['spec_version', signed_extensions['CheckSpecVersion']['additional_signed']]
+                )
+
+            if 'CheckTxVersion' in signed_extensions:
+                signature_payload.type_mapping.append(
+                    ['transaction_version', signed_extensions['CheckTxVersion']['additional_signed']]
+                )
+
+            if 'CheckGenesis' in signed_extensions:
+                signature_payload.type_mapping.append(
+                    ['genesis_hash', signed_extensions['CheckGenesis']['additional_signed']]
+                )
+
+            if 'CheckMortality' in signed_extensions:
+                signature_payload.type_mapping.append(
+                    ['block_hash', signed_extensions['CheckMortality']['additional_signed']]
+                )
+
+            if 'CheckEra' in signed_extensions:
+                signature_payload.type_mapping.append(
+                    ['block_hash', signed_extensions['CheckEra']['additional_signed']]
+                )
 
         if include_call_length:
 
@@ -1663,13 +1735,12 @@ class SubstrateInterface:
             'era': era,
             'nonce': nonce,
             'tip': tip,
-            'specVersion': self.runtime_version,
-            'genesisHash': genesis_hash,
-            'blockHash': block_hash
+            'spec_version': self.runtime_version,
+            'genesis_hash': genesis_hash,
+            'block_hash': block_hash,
+            'transaction_version': self.transaction_version,
+            'asset_id': {'tip': tip, 'asset_id': tip_asset_id}
         }
-
-        if self.transaction_version is not None:
-            payload_dict['transactionVersion'] = self.transaction_version
 
         signature_payload.encode(payload_dict)
 
@@ -1678,7 +1749,8 @@ class SubstrateInterface:
 
         return signature_payload.data
 
-    def create_signed_extrinsic(self, call, keypair: Keypair, era=None, nonce=None, tip=0, signature=None):
+    def create_signed_extrinsic(self, call: GenericCall, keypair: Keypair, era: dict = None, nonce: int = None,
+                                tip: int = 0, tip_asset_id: int = None, signature: str = None) -> GenericExtrinsic:
         """
         Creates a extrinsic signed by given account details
 
@@ -1686,19 +1758,28 @@ class SubstrateInterface:
         ----------
         call: GenericCall to create extrinsic for
         keypair: Keypair used to sign the extrinsic
-        era: Specify mortality in blocks in follow format: {'period': <amount_blocks>} If omitted the extrinsic is immortal
+        era: Specify mortality in blocks in follow format: {'period': [amount_blocks]} If omitted the extrinsic is immortal
         nonce: nonce to include in extrinsics, if omitted the current nonce is retrieved on-chain
-        tip: specify tip to gain priority during network congestion
+        tip: The tip for the block author to gain priority during network congestion
+        tip_asset_id: Optional asset ID with which to pay the tip
         signature: Optionally provide signature if externally signed
 
         Returns
         -------
-        ExtrinsicsDecoder The signed Extrinsic
+        GenericExtrinsic The signed Extrinsic
         """
+
+        self.init_runtime()
 
         # Check requirements
         if not isinstance(call, GenericCall):
             raise TypeError("'call' must be of type Call")
+
+        # Check if extrinsic version is supported
+        if self.metadata_decoder[1][1]['extrinsic']['version'] != 4:
+            raise NotImplementedError(
+                f"Extrinsic version {self.metadata_decoder[1][1]['extrinsic']['version']} not supported"
+            )
 
         # Retrieve nonce
         if nonce is None:
@@ -1719,13 +1800,16 @@ class SubstrateInterface:
             # Check if signature is a MultiSignature and contains signature version
             if len(signature) == 130:
                 signature_version = int(signature[0:2], 16)
-                signature = '0x{}'.format(signature[2:])
+                signature = bytes.fromhex(signature[2:])
             else:
                 signature_version = keypair.crypto_type
+                signature = bytes.fromhex(signature)
 
         else:
             # Create signature payload
-            signature_payload = self.generate_signature_payload(call=call, era=era, nonce=nonce, tip=tip)
+            signature_payload = self.generate_signature_payload(
+                call=call, era=era, nonce=nonce, tip=tip, tip_asset_id=tip_asset_id
+            )
 
             # Set Signature version to crypto type of keypair
             signature_version = keypair.crypto_type
@@ -1734,28 +1818,30 @@ class SubstrateInterface:
             signature = keypair.sign(signature_payload)
 
         # Create extrinsic
-        extrinsic = ScaleDecoder.get_decoder_class(
-            type_string='Extrinsic', metadata=self.metadata_decoder, runtime_config=self.runtime_config
-        )
+        extrinsic = self.runtime_config.create_scale_object(type_string='Extrinsic', metadata=self.metadata_decoder)
 
-        extrinsic.encode({
-            'account_id': keypair.public_key,
-            'signature_version': signature_version,
-            'signature': signature,
+        value = {
+            'account_id': f'0x{keypair.public_key.hex()}',
+            'signature': f'0x{signature.hex()}',
             'call_function': call.value['call_function'],
             'call_module': call.value['call_module'],
             'call_args': call.value['call_args'],
             'nonce': nonce,
             'era': era,
-            'tip': tip
-        })
+            'tip': tip,
+            'asset_id': {'tip': tip, 'asset_id': tip_asset_id}
+        }
 
-        # Set extrinsic hash
-        extrinsic.extrinsic_hash = extrinsic.generate_hash()
+        # Check if ExtrinsicSignature is MultiSignature, otherwise omit signature_version
+        signature_cls = self.runtime_config.get_decoder_class("ExtrinsicSignature")
+        if type(signature_cls.type_mapping) is list:
+            value['signature_version'] = signature_version
+
+        extrinsic.encode(value)
 
         return extrinsic
 
-    def create_unsigned_extrinsic(self, call):
+    def create_unsigned_extrinsic(self, call: GenericCall) -> GenericExtrinsic:
         """
         Create unsigned extrinsic for given `Call`
         Parameters
@@ -1764,12 +1850,13 @@ class SubstrateInterface:
 
         Returns
         -------
-        ExtrinsicsDecoder
+        GenericExtrinsic
         """
+
+        self.init_runtime()
+
         # Create extrinsic
-        extrinsic = ScaleDecoder.get_decoder_class(
-            type_string='Extrinsic', metadata=self.metadata_decoder, runtime_config=self.runtime_config
-        )
+        extrinsic = self.runtime_config.create_scale_object(type_string='Extrinsic', metadata=self.metadata_decoder)
 
         extrinsic.encode({
             'call_function': call.value['call_function'],
@@ -1779,24 +1866,28 @@ class SubstrateInterface:
 
         return extrinsic
 
-    def submit_extrinsic(self, extrinsic, wait_for_inclusion=False, wait_for_finalization=False) -> "ExtrinsicReceipt":
+    def submit_extrinsic(self, extrinsic: GenericExtrinsic, wait_for_inclusion: bool = False,
+                         wait_for_finalization: bool = False) -> "ExtrinsicReceipt":
         """
+        Submit an extrinsic to the connected node, with the possibility to wait until the extrinsic is included
+         in a block and/or the block is finalized. The receipt returned provided information about the block and
+         triggered events
 
         Parameters
         ----------
-        extrinsic: ExtrinsicsDecoder The extinsic to be send to the network
+        extrinsic: Extrinsic The extrinsic to be sent to the network
         wait_for_inclusion: wait until extrinsic is included in a block (only works for websocket connections)
         wait_for_finalization: wait until extrinsic is finalized (only works for websocket connections)
 
         Returns
         -------
-        The hash of the extrinsic submitted to the network
+        ExtrinsicReceipt
 
         """
 
         # Check requirements
-        if extrinsic.__class__.__name__ != 'ExtrinsicsDecoder':
-            raise TypeError("'extrinsic' must be of type ExtrinsicsDecoder")
+        if not isinstance(extrinsic, GenericExtrinsic):
+            raise TypeError("'extrinsic' must be of type Extrinsics")
 
         def result_handler(message, update_nr, subscription_id):
             # Check if extrinsic is included and finalized
@@ -1805,14 +1896,14 @@ class SubstrateInterface:
                     self.rpc_request('author_unwatchExtrinsic', [subscription_id])
                     return {
                         'block_hash': message['params']['result']['finalized'],
-                        'extrinsic_hash': '0x{}'.format(extrinsic.extrinsic_hash),
+                        'extrinsic_hash': '0x{}'.format(extrinsic.extrinsic_hash.hex()),
                         'finalized': True
                     }
                 elif 'inBlock' in message['params']['result'] and wait_for_inclusion and not wait_for_finalization:
                     self.rpc_request('author_unwatchExtrinsic', [subscription_id])
                     return {
                         'block_hash': message['params']['result']['inBlock'],
-                        'extrinsic_hash': '0x{}'.format(extrinsic.extrinsic_hash),
+                        'extrinsic_hash': '0x{}'.format(extrinsic.extrinsic_hash.hex()),
                         'finalized': False
                     }
 
@@ -1844,14 +1935,14 @@ class SubstrateInterface:
 
         return result
 
-    def get_payment_info(self, call, keypair):
+    def get_payment_info(self, call: GenericCall, keypair: Keypair):
         """
         Retrieves fee estimation via RPC for given extrinsic
 
         Parameters
         ----------
-        call Call object to estimate fees for
-        keypair Keypair of the sender, does not have to include private key because no valid signature is required
+        call: Call object to estimate fees for
+        keypair: Keypair of the sender, does not have to include private key because no valid signature is required
 
         Returns
         -------
@@ -1887,7 +1978,7 @@ class SubstrateInterface:
         else:
             raise SubstrateRequestException(payment_info['error']['message'])
 
-    def process_metadata_typestring(self, type_string, parent_type_strings: list = None):
+    def process_metadata_typestring(self, type_string: str, parent_type_strings: list = None):
         """
         Process how given type_string is decoded with active runtime and type registry
 
@@ -1941,9 +2032,7 @@ class SubstrateInterface:
 
             # Not in type registry, try get hard coded decoder classes
             try:
-                decoder_class_obj = ScaleDecoder.get_decoder_class(
-                    type_string=type_string, runtime_config=self.runtime_config
-                )
+                decoder_class_obj = self.runtime_config.create_scale_object(type_string=type_string)
                 decoder_class = decoder_class_obj.__class__
             except NotImplementedError as e:
                 decoder_class = None
@@ -1965,12 +2054,12 @@ class SubstrateInterface:
                 type_info["is_primitive_runtime"] = False
 
             for data_type in decoder_class.type_mapping:
+                if data_type:
+                    if type(data_type) in [list, tuple]:
+                        data_type = data_type[1]
 
-                if type(data_type) in [list, tuple]:
-                    data_type = data_type[1]
-
-                if data_type not in parent_type_strings:
-                    self.process_metadata_typestring(data_type, parent_type_strings=parent_type_strings)
+                    if type(data_type) is not dict and data_type not in parent_type_strings:
+                        self.process_metadata_typestring(data_type, parent_type_strings=parent_type_strings)
 
         # Try to get superclass as actual decoding class if not root level 'ScaleType'
         if decoder_class and len(decoder_class.__mro__) > 1 and decoder_class.__mro__[1].__name__ != 'ScaleType':
@@ -1982,7 +2071,9 @@ class SubstrateInterface:
             if type_info["is_primitive_runtime"] is None:
                 type_info["is_primitive_runtime"] = True
 
-            if type_info["is_primitive_runtime"] and type_string.lower() in ScaleDecoder.PRIMITIVES:
+            if type_info["is_primitive_runtime"] and type_string.lower() in \
+                    ('bool', 'u8', 'u16', 'u32', 'u64', 'u128', 'u256', 'i8', 'i16', 'i32', 'i64', 'i128',
+                    'i256', 'h160', 'h256', 'h512', '[u8; 4]', '[u8; 4]', '[u8; 8]', '[u8; 16]', '[u8; 32]', '&[u8]'):
                 type_info["is_primitive_core"] = True
         else:
             type_info["is_primitive_runtime"] = None
@@ -1992,7 +2083,7 @@ class SubstrateInterface:
 
         return decoder_class
 
-    def get_type_registry(self, block_hash=None):
+    def get_type_registry(self, block_hash: str = None) -> dict:
         """
         Generates an exhaustive list of which RUST types exist in the runtime specified at given block_hash (or
         chaintip if block_hash is omitted)
@@ -2003,13 +2094,13 @@ class SubstrateInterface:
 
         Returns
         -------
-
+        dict
         """
         self.init_runtime(block_hash=block_hash)
 
         if self.runtime_version not in self.type_registry_cache:
 
-            for module in self.metadata_decoder.metadata.modules:
+            for module in self.metadata_decoder.pallets:
 
                 # Storage backwards compt check
                 if module.storage and isinstance(module.storage, list):
@@ -2028,39 +2119,16 @@ class SubstrateInterface:
                     for event_index, event in enumerate(module.events):
 
                         for arg_index, arg in enumerate(event.args):
-                            self.process_metadata_typestring(arg)
+                            self.process_metadata_typestring(arg.type)
 
                 if len(storage_functions) > 0:
                     for idx, storage in enumerate(storage_functions):
 
-                        # Determine type
-
-                        if storage.type.get('PlainType'):
-                            type_keys = []
-                            type_value = storage.type.get('PlainType')
-
-                        elif storage.type.get('MapType'):
-                            type_keys = [storage.type['MapType'].get('key')]
-                            type_value = storage.type['MapType'].get('value')
-
-                        elif storage.type.get('DoubleMapType'):
-                            type_keys = [
-                                storage.type['DoubleMapType'].get('key1'), storage.type['DoubleMapType'].get('key2')
-                            ]
-                            type_value = storage.type['DoubleMapType'].get('value')
-
-                        elif storage.type.get('NMapType'):
-                            type_keys = storage.type['NMapType'].get('keys')
-                            type_value = storage.type['NMapType'].get('value')
-
-                        else:
-                            raise ValueError("Unsupported storage type")
-
                         # Add type value
-                        self.process_metadata_typestring(type_value)
+                        self.process_metadata_typestring(storage.get_value_type_string())
 
                         # Add type keys
-                        for type_key in type_keys:
+                        for type_key in storage.get_params_type_string():
                             self.process_metadata_typestring(type_key)
 
                 if len(module.constants or []) > 0:
@@ -2070,7 +2138,7 @@ class SubstrateInterface:
 
         return self.type_registry_cache[self.runtime_version]
 
-    def get_type_definition(self, type_string, block_hash=None):
+    def get_type_definition(self, type_string: str, block_hash: str = None):
         """
         Retrieves decoding specifications of given type_string
 
@@ -2104,14 +2172,13 @@ class SubstrateInterface:
             'metadata_index': idx,
             'module_id': module.get_identifier(),
             'name': module.name,
-            'prefix': module.prefix,
             'spec_version': self.runtime_version,
             'count_call_functions': len(module.calls or []),
-            'count_storage_functions': len(module.calls or []),
+            'count_storage_functions': len(module.storage or []),
             'count_events': len(module.events or []),
             'count_constants': len(module.constants or []),
             'count_errors': len(module.errors or []),
-        } for idx, module in enumerate(self.metadata_decoder.metadata.modules)]
+        } for idx, module in enumerate(self.metadata_decoder.pallets)]
 
     def get_metadata_module(self, name, block_hash=None):
         """
@@ -2128,11 +2195,9 @@ class SubstrateInterface:
         """
         self.init_runtime(block_hash=block_hash)
 
-        for module in self.metadata_decoder.metadata.modules:
-            if module.name == name:
-                return module
+        return self.metadata_decoder.get_metadata_pallet(name)
 
-    def get_metadata_call_functions(self, block_hash=None):
+    def get_metadata_call_functions(self, block_hash=None) -> list:
         """
         Retrieves a list of all call functions in metadata active for given block_hash (or chaintip if block_hash is omitted)
 
@@ -2142,21 +2207,25 @@ class SubstrateInterface:
 
         Returns
         -------
-
+        list
         """
         self.init_runtime(block_hash=block_hash)
 
         call_list = []
 
-        for call_index, (module, call) in self.metadata_decoder.call_index.items():
-            call_list.append(
-                self.serialize_module_call(
-                    module, call, self.runtime_version, call_index
-                )
-            )
+        for pallet in self.metadata_decoder.pallets:
+            if pallet.calls:
+                for call in pallet.calls:
+
+                    call_list.append(
+                        self.serialize_module_call(
+                            pallet, call, self.runtime_version, ''
+                        )
+                    )
+
         return call_list
 
-    def get_metadata_call_function(self, module_name, call_function_name, block_hash=None):
+    def get_metadata_call_function(self, module_name: str, call_function_name: str, block_hash: str = None):
         """
         Retrieves the details of a call function given module name, call function name and block_hash
         (or chaintip if block_hash is omitted)
@@ -2173,12 +2242,13 @@ class SubstrateInterface:
         """
         self.init_runtime(block_hash=block_hash)
 
-        for call_index, (module, call) in self.metadata_decoder.call_index.items():
-            if module.name == module_name and \
-                    call.get_identifier() == call_function_name:
-                return call
+        for pallet in self.metadata_decoder.pallets:
+            if pallet.name == module_name and pallet.calls:
+                for call in pallet.calls:
+                    if call.name == call_function_name:
+                        return call
 
-    def get_metadata_events(self, block_hash=None):
+    def get_metadata_events(self, block_hash=None) -> list:
         """
         Retrieves a list of all events in metadata active for given block_hash (or chaintip if block_hash is omitted)
 
@@ -2188,7 +2258,7 @@ class SubstrateInterface:
 
         Returns
         -------
-
+        list
         """
 
         self.init_runtime(block_hash=block_hash)
@@ -2222,12 +2292,13 @@ class SubstrateInterface:
 
         self.init_runtime(block_hash=block_hash)
 
-        for event_index, (module, event) in self.metadata_decoder.event_index.items():
-            if module.name == module_name and \
-                    event.name == event_name:
-                return event
+        for pallet in self.metadata_decoder.pallets:
+            if pallet.name == module_name and pallet.events:
+                for event in pallet.events:
+                    if event.name == event_name:
+                        return event
 
-    def get_metadata_constants(self, block_hash=None):
+    def get_metadata_constants(self, block_hash=None) -> list:
         """
         Retrieves a list of all constants in metadata active at given block_hash (or chaintip if block_hash is omitted)
 
@@ -2237,14 +2308,14 @@ class SubstrateInterface:
 
         Returns
         -------
-
+        list
         """
 
         self.init_runtime(block_hash=block_hash)
 
         constant_list = []
 
-        for module_idx, module in enumerate(self.metadata_decoder.metadata.modules):
+        for module_idx, module in enumerate(self.metadata_decoder.pallets):
             for constant in module.constants or []:
                 constant_list.append(
                     self.serialize_constant(
@@ -2272,15 +2343,14 @@ class SubstrateInterface:
 
         self.init_runtime(block_hash=block_hash)
 
-        for module_idx, module in enumerate(self.metadata_decoder.metadata.modules):
+        for module_idx, module in enumerate(self.metadata_decoder.pallets):
 
             if module_name == module.name and module.constants:
 
                 for constant in module.constants:
-                    if constant_name == constant.name:
+                    if constant_name == constant.value['name']:
                         return constant
 
-    @lru_cache(maxsize=1000)
     def get_constant(self, module_name, constant_name, block_hash=None) -> Optional[ScaleType]:
         """
         Returns the decoded `ScaleType` object of the constant for given module name, call function name and block_hash
@@ -2300,9 +2370,11 @@ class SubstrateInterface:
         constant = self.get_metadata_constant(module_name, constant_name, block_hash=block_hash)
         if constant:
             # Decode to ScaleType
-            return self.decode_scale(constant.type, ScaleBytes(constant.constant_value), return_scale_obj=True)
+            return self.decode_scale(
+                constant.type, ScaleBytes(constant.constant_value), block_hash=block_hash, return_scale_obj=True
+            )
 
-    def get_metadata_storage_functions(self, block_hash=None):
+    def get_metadata_storage_functions(self, block_hash=None) -> list:
         """
         Retrieves a list of all storage functions in metadata active at given block_hash (or chaintip if block_hash is
         omitted)
@@ -2313,15 +2385,15 @@ class SubstrateInterface:
 
         Returns
         -------
-
+        list
         """
         self.init_runtime(block_hash=block_hash)
 
         storage_list = []
 
-        for module_idx, module in enumerate(self.metadata_decoder.metadata.modules):
+        for module_idx, module in enumerate(self.metadata_decoder.pallets):
             if module.storage:
-                for storage in module.storage.items:
+                for storage in module.storage:
                     storage_list.append(
                         self.serialize_storage_item(
                             storage_item=storage,
@@ -2348,13 +2420,12 @@ class SubstrateInterface:
         """
         self.init_runtime(block_hash=block_hash)
 
-        for module_idx, module in enumerate(self.metadata_decoder.metadata.modules):
-            if module.name == module_name and module.storage:
-                for storage in module.storage.items:
-                    if storage.name == storage_name:
-                        return storage
+        pallet = self.metadata_decoder.get_metadata_pallet(module_name)
 
-    def get_metadata_errors(self, block_hash=None):
+        if pallet:
+            return pallet.get_storage_function(storage_name)
+
+    def get_metadata_errors(self, block_hash=None) -> list:
         """
         Retrieves a list of all errors in metadata active at given block_hash (or chaintip if block_hash is omitted)
 
@@ -2364,13 +2435,13 @@ class SubstrateInterface:
 
         Returns
         -------
-
+        list
         """
         self.init_runtime(block_hash=block_hash)
 
         error_list = []
 
-        for module_idx, module in enumerate(self.metadata_decoder.metadata.modules):
+        for module_idx, module in enumerate(self.metadata_decoder.pallets):
             if module.errors:
                 for error in module.errors:
                     error_list.append(
@@ -2397,13 +2468,12 @@ class SubstrateInterface:
         """
         self.init_runtime(block_hash=block_hash)
 
-        for module_idx, module in enumerate(self.metadata_decoder.metadata.modules):
+        for module_idx, module in enumerate(self.metadata_decoder.pallets):
             if module.name == module_name and module.errors:
                 for error in module.errors:
                     if error_name == error.name:
                         return error
 
-    @block_dependent_lru_cache(maxsize=1000)
     def __get_block_handler(self, block_hash: str, ignore_decoding_errors: bool = False, include_author: bool = False,
                             header_only: bool = False, finalized_only: bool = False,
                             subscription_handler: callable = None):
@@ -2413,15 +2483,19 @@ class SubstrateInterface:
         except BlockNotFound:
             return None
 
-        def decode_block(block_data):
+        def decode_block(block_data, block_data_hash=None):
 
             if block_data:
-                block_data['header']['hash'] = block_hash
+                if block_data_hash:
+                    block_data['header']['hash'] = block_data_hash
+
                 block_data['header']['number'] = int(block_data['header']['number'], 16)
+
+                extrinsic_cls = self.runtime_config.get_decoder_class('Extrinsic')
 
                 if 'extrinsics' in block_data:
                     for idx, extrinsic_data in enumerate(block_data['extrinsics']):
-                        extrinsic_decoder = Extrinsic(
+                        extrinsic_decoder = extrinsic_cls(
                             data=ScaleBytes(extrinsic_data),
                             metadata=self.metadata_decoder,
                             runtime_config=self.runtime_config
@@ -2430,7 +2504,7 @@ class SubstrateInterface:
                             extrinsic_decoder.decode()
                             block_data['extrinsics'][idx] = extrinsic_decoder
 
-                        except Exception:
+                        except Exception as e:
                             if not ignore_decoding_errors:
                                 raise
                             block_data['extrinsics'][idx] = None
@@ -2438,7 +2512,11 @@ class SubstrateInterface:
                 for idx, log_data in enumerate(block_data['header']["digest"]["logs"]):
 
                     try:
-                        log_digest_cls = self.runtime_config.get_decoder_class('DigestItem')
+                        log_digest_cls = self.runtime_config.get_decoder_class('sp_runtime::generic::digest::DigestItem')
+
+                        if log_digest_cls is None:
+                            raise NotImplementedError("No decoding class found for 'DigestItem'")
+
                         log_digest = log_digest_cls(data=ScaleBytes(log_data))
                         log_digest.decode()
 
@@ -2446,16 +2524,37 @@ class SubstrateInterface:
 
                         if include_author and 'PreRuntime' in log_digest.value:
 
-                            if log_digest.value['PreRuntime']['engine'] == 'BABE':
-                                validator_set = self.query("Session", "Validators", block_hash=block_hash)
-                                rank_validator = log_digest.value['PreRuntime']['data']['authorityIndex']
+                            if self.implements_scaleinfo():
+                                if log_digest.value['PreRuntime'][0] == f"0x{b'BABE'.hex()}":
+                                    babe_predigest = self.runtime_config.create_scale_object(
+                                        type_string='RawBabePreDigest',
+                                        data=ScaleBytes(log_digest.value['PreRuntime'][1])
+                                    )
 
-                                block_author = validator_set.elements[rank_validator]
-                                block_data['author'] = block_author.value
+                                    babe_predigest.decode()
+
+                                    validator_set = self.query("Session", "Validators", block_hash=block_hash)
+                                    rank_validator = babe_predigest[1].value['authority_index']
+
+                                    block_author = validator_set[rank_validator]
+                                    block_data['author'] = block_author.value
+
+                                else:
+                                    raise NotImplementedError(
+                                        f"Cannot extract author for engine {log_digest.value['PreRuntime'][0]}"
+                                    )
                             else:
-                                raise NotImplementedError(
-                                    f"Cannot extract author for engine {log_digest.value['PreRuntime']['engine']}"
-                                )
+
+                                if log_digest.value['PreRuntime']['engine'] == 'BABE':
+                                    validator_set = self.query("Session", "Validators", block_hash=block_hash)
+                                    rank_validator = log_digest.value['PreRuntime']['data']['authority_index']
+
+                                    block_author = validator_set.elements[rank_validator]
+                                    block_data['author'] = block_author.value
+                                else:
+                                    raise NotImplementedError(
+                                        f"Cannot extract author for engine {log_digest.value['PreRuntime']['engine']}"
+                                    )
 
                     except Exception:
                         if not ignore_decoding_errors:
@@ -2488,14 +2587,14 @@ class SubstrateInterface:
 
             if header_only:
                 response = self.rpc_request('chain_getHeader', [block_hash])
-                return decode_block({'header': response['result']})
+                return decode_block({'header': response['result']}, block_data_hash=block_hash)
 
             else:
                 response = self.rpc_request('chain_getBlock', [block_hash])
-                return decode_block(response['result']['block'])
+                return decode_block(response['result']['block'], block_data_hash=block_hash)
 
     def get_block(self, block_hash: str = None, block_number: int = None, ignore_decoding_errors: bool = False,
-                  include_author: bool = False, finalized_only: bool = False):
+                  include_author: bool = False, finalized_only: bool = False) -> Optional[dict]:
         """
         Retrieves a block and decodes its containing extrinsics and log digest items. If `block_hash` and `block_number`
         is omited the chain tip will be retrieve, or the finalized head if `finalized_only` is set to true.
@@ -2632,10 +2731,26 @@ class SubstrateInterface:
             include_author=include_author, finalized_only=finalized_only
         )
 
+    def retrieve_extrinsic_by_identifier(self, extrinsic_identifier: str) -> "ExtrinsicReceipt":
+        """
+        Retrieve an extrinsic by its identifier in format "[block_number]-[extrinsic_index]" e.g. 333456-4
+
+        Parameters
+        ----------
+        extrinsic_identifier
+
+        Returns
+        -------
+        ExtrinsicReceipt
+        """
+        return ExtrinsicReceipt.create_from_extrinsic_identifier(
+            substrate=self, extrinsic_identifier=extrinsic_identifier
+        )
+
     def get_runtime_block(self, block_hash: str = None, block_id: int = None, ignore_decoding_errors: bool = False,
                           include_author: bool = False):
         """
-        Retrieves a block with method `chain_getBlock` and in addition decodes extrinsics and log items
+        Warning: 'get_runtime_block' will be replaced by 'get_block'
 
         Parameters
         ----------
@@ -2686,11 +2801,10 @@ class SubstrateInterface:
         if type(scale_bytes) == str:
             scale_bytes = ScaleBytes(scale_bytes)
 
-        obj = ScaleDecoder.get_decoder_class(
+        obj = self.runtime_config.create_scale_object(
             type_string=type_string,
             data=scale_bytes,
-            metadata=self.metadata_decoder,
-            runtime_config=self.runtime_config
+            metadata=self.metadata_decoder
         )
 
         obj.decode()
@@ -2700,7 +2814,7 @@ class SubstrateInterface:
         else:
             return obj.value
 
-    def encode_scale(self, type_string, value, block_hash=None):
+    def encode_scale(self, type_string, value, block_hash=None) -> ScaleBytes:
         """
         Helper function to encode arbitrary data into SCALE-bytes for given RUST type_string
 
@@ -2712,16 +2826,16 @@ class SubstrateInterface:
 
         Returns
         -------
-
+        ScaleBytes
         """
         self.init_runtime(block_hash=block_hash)
 
-        obj = ScaleDecoder.get_decoder_class(
-            type_string=type_string, metadata=self.metadata_decoder, runtime_config=self.runtime_config
+        obj = self.runtime_config.create_scale_object(
+            type_string=type_string, metadata=self.metadata_decoder
         )
         return obj.encode(value)
 
-    def ss58_encode(self, public_key: str) -> str:
+    def ss58_encode(self, public_key: Union[str, bytes]) -> str:
         """
         Helper function to encode a public key to SS58 address
 
@@ -2731,7 +2845,7 @@ class SubstrateInterface:
 
         Returns
         -------
-        SS58 address
+        str containing the SS58 address
         """
         return ss58_encode(public_key, ss58_format=self.ss58_format)
 
@@ -2745,7 +2859,7 @@ class SubstrateInterface:
 
         Returns
         -------
-        Public key
+        str containing the hex representation of the public key
         """
         return ss58_decode(ss58_address, valid_ss58_format=self.ss58_format)
 
@@ -2765,7 +2879,7 @@ class SubstrateInterface:
 
     # Serializing helper function
 
-    def serialize_storage_item(self, storage_item, module, spec_version_id):
+    def serialize_storage_item(self, storage_item, module, spec_version_id) -> dict:
         """
         Helper function to serialize a storage item
 
@@ -2777,62 +2891,51 @@ class SubstrateInterface:
 
         Returns
         -------
-
+        dict
         """
         storage_dict = {
             "storage_name": storage_item.name,
             "storage_modifier": storage_item.modifier,
-            "storage_fallback_scale": storage_item.fallback,
-            "storage_fallback": None,
+            "storage_default_scale": storage_item['default'].get_used_bytes(),
+            "storage_default": None,
             "documentation": '\n'.join(storage_item.docs),
             "module_id": module.get_identifier(),
-            "module_prefix": module.prefix,
+            "module_prefix": module.value['storage']['prefix'],
             "module_name": module.name,
             "spec_version": spec_version_id,
-            "type_key1": None,
-            "type_key2": None,
-            "type_hasher_key1": None,
-            "type_hasher_key2": None,
-            "type_value": None,
-            "type_is_linked": None
+            "type_keys": storage_item.get_params_type_string(),
+            "type_hashers": storage_item.get_param_hashers(),
+            "type_value": storage_item.get_value_type_string()
         }
 
         type_class, type_info = next(iter(storage_item.type.items()))
 
         storage_dict["type_class"] = type_class
 
-        if type_class == 'PlainType':
-            storage_dict["type_value"] = type_info
+        value_scale_type = storage_item.get_value_type_string()
 
-        elif type_class == 'MapType':
-            storage_dict["type_value"] = type_info["value"]
-            storage_dict["type_key1"] = type_info["key"]
-            storage_dict["type_hasher_key1"] = type_info["hasher"]
-            storage_dict["type_is_linked"] = type_info["isLinked"]
+        if storage_item.value['modifier'] == 'Default':
+            # Fallback to default value of storage function if no result
+            query_value = storage_item.value_object['default'].value_object
+        else:
+            # No result is interpreted as an Option<...> result
+            value_scale_type = f'Option<{value_scale_type}>'
+            query_value = storage_item.value_object['default'].value_object
 
-        elif type_class == 'DoubleMapType':
-
-            storage_dict["type_value"] = type_info["value"]
-            storage_dict["type_key1"] = type_info["key1"]
-            storage_dict["type_key2"] = type_info["key2"]
-            storage_dict["type_hasher_key1"] = type_info["hasher"]
-            storage_dict["type_hasher_key2"] = type_info["key2Hasher"]
-
-        if storage_item.fallback != '0x00':
-            # Decode fallback
-            try:
-                fallback_obj = ScaleDecoder.get_decoder_class(
-                    type_string=storage_dict["type_value"],
-                    data=ScaleBytes(storage_item.fallback),
-                    runtime_config=self.runtime_config
-                )
-                storage_dict["storage_fallback"] = fallback_obj.decode()
-            except Exception:
-                storage_dict["storage_fallback"] = '[decoding error]'
+        try:
+            obj = self.runtime_config.create_scale_object(
+                type_string=value_scale_type,
+                data=ScaleBytes(query_value),
+                metadata=self.metadata_decoder
+            )
+            obj.decode()
+            storage_dict["storage_default"] = obj.decode()
+        except Exception:
+            storage_dict["storage_default"] = '[decoding error]'
 
         return storage_dict
 
-    def serialize_constant(self, constant, module, spec_version_id):
+    def serialize_constant(self, constant, module, spec_version_id) -> dict:
         """
         Helper function to serialize a constant
 
@@ -2844,11 +2947,11 @@ class SubstrateInterface:
 
         Returns
         -------
-
+        dict
         """
         try:
-            value_obj = ScaleDecoder.get_decoder_class(
-                type_string=constant.type, data=ScaleBytes(constant.constant_value), runtime_config=self.runtime_config
+            value_obj = self.runtime_config.create_scale_object(
+                type_string=constant.type, data=ScaleBytes(constant.constant_value)
             )
             constant_decoded_value = value_obj.decode()
         except Exception:
@@ -2858,15 +2961,15 @@ class SubstrateInterface:
             "constant_name": constant.name,
             "constant_type": constant.type,
             "constant_value": constant_decoded_value,
-            "constant_value_scale": constant.constant_value,
+            "constant_value_scale": f"0x{constant.constant_value.hex()}",
             "documentation": '\n'.join(constant.docs),
             "module_id": module.get_identifier(),
-            "module_prefix": module.prefix,
+            "module_prefix": module.value['storage']['prefix'] if module.value['storage'] else None,
             "module_name": module.name,
             "spec_version": spec_version_id
         }
 
-    def serialize_module_call(self, module, call, spec_version, call_index):
+    def serialize_module_call(self, module, call, spec_version, call_index=None) -> dict:
         """
         Helper function to serialize a call function
 
@@ -2879,21 +2982,21 @@ class SubstrateInterface:
 
         Returns
         -------
-
+        dict
         """
         return {
-            "call_id": call.get_identifier(),
+            # "call_id": call.get_identifier(),
             "call_name": call.name,
             "call_args": [call_arg.value for call_arg in call.args],
-            "lookup": '0x{}'.format(call_index),
+            # "lookup": '0x{}'.format(call_index),
             "documentation": '\n'.join(call.docs),
-            "module_id": module.get_identifier(),
-            "module_prefix": module.prefix,
+            # "module_id": module.get_identifier(),
+            "module_prefix": module.value['storage']['prefix'] if module.value['storage'] else None,
             "module_name": module.name,
             "spec_version": spec_version
         }
 
-    def serialize_module_event(self, module, event, spec_version, event_index):
+    def serialize_module_event(self, module, event, spec_version, event_index) -> dict:
         """
         Helper function to serialize an event
 
@@ -2906,7 +3009,7 @@ class SubstrateInterface:
 
         Returns
         -------
-
+        dict
         """
         return {
             "event_id": event.name,
@@ -2925,7 +3028,7 @@ class SubstrateInterface:
             "spec_version": spec_version
         }
 
-    def serialize_module_error(self, module, error, spec_version):
+    def serialize_module_error(self, module, error, spec_version) -> dict:
         """
         Helper function to serialize an error
 
@@ -2937,18 +3040,18 @@ class SubstrateInterface:
 
         Returns
         -------
-
+        dict
         """
         return {
             "error_name": error.name,
             "documentation": '\n'.join(error.docs),
             "module_id": module.get_identifier(),
-            "module_prefix": module.prefix,
+            "module_prefix": module.value['storage']['prefix'] if module.value['storage'] else None,
             "module_name": module.name,
             "spec_version": spec_version
         }
 
-    def update_type_registry_presets(self):
+    def update_type_registry_presets(self) -> bool:
         try:
             update_type_registries()
             self.reload_type_registry(use_remote_preset=False)
@@ -2956,7 +3059,7 @@ class SubstrateInterface:
         except Exception:
             return False
 
-    def reload_type_registry(self, use_remote_preset: bool = True):
+    def reload_type_registry(self, use_remote_preset: bool = True, auto_discover: bool = True):
         """
         Reload type registry and preset used to instantiate the SubtrateInterface object. Useful to periodically apply
         changes in type definitions when a runtime upgrade occurred
@@ -2964,6 +3067,7 @@ class SubstrateInterface:
         Parameters
         ----------
         use_remote_preset: When True preset is downloaded from Github master, otherwise use files from local installed scalecodec package
+        auto_discover
 
         Returns
         -------
@@ -2971,7 +3075,14 @@ class SubstrateInterface:
         """
         self.runtime_config.clear_type_registry()
 
-        if self.type_registry_preset:
+        self.runtime_config.implements_scale_info = self.implements_scaleinfo()
+
+        # Load metadata types in runtime configuration
+        self.runtime_config.update_type_registry(load_type_registry_preset(name="metadata_types"))
+        self.apply_type_registry_presets(use_remote_preset=use_remote_preset, auto_discover=auto_discover)
+
+    def apply_type_registry_presets(self, use_remote_preset: bool = True, auto_discover: bool = True):
+        if self.type_registry_preset is not None:
             # Load type registry according to preset
             type_registry_preset_dict = load_type_registry_preset(
                 name=self.type_registry_preset, use_remote_preset=use_remote_preset
@@ -2979,21 +3090,27 @@ class SubstrateInterface:
 
             if not type_registry_preset_dict:
                 raise ValueError(f"Type registry preset '{self.type_registry_preset}' not found")
-        else:
+
+        elif auto_discover:
             # Try to auto discover type registry preset by chain name
-            type_registry_preset_dict = load_type_registry_preset(self.chain.lower())
+            type_registry_name = self.chain.lower().replace(' ', '-')
+            try:
+                type_registry_preset_dict = load_type_registry_preset(type_registry_name)
+                self.debug_message(f"Auto set type_registry_preset to {type_registry_name} ...")
+                self.type_registry_preset = type_registry_name
+            except ValueError:
+                type_registry_preset_dict = None
 
-            if not type_registry_preset_dict:
-                raise ValueError(f"Could not auto-detect type registry preset for chain '{self.chain}'")
-
-            self.debug_message(f"Auto set type_registry_preset to {self.chain.lower()} ...")
-            self.type_registry_preset = self.chain.lower()
+        else:
+            type_registry_preset_dict = None
 
         if type_registry_preset_dict:
             # Load type registries in runtime configuration
-            self.runtime_config.update_type_registry(
-                load_type_registry_preset("default", use_remote_preset=use_remote_preset)
-            )
+            if self.implements_scaleinfo() is False:
+                # Only runtime with no embedded types in metadata need the default set of explicit defined types
+                self.runtime_config.update_type_registry(
+                    load_type_registry_preset("default", use_remote_preset=use_remote_preset)
+                )
 
             if self.type_registry_preset != "default":
                 self.runtime_config.update_type_registry(type_registry_preset_dict)
@@ -3005,7 +3122,8 @@ class SubstrateInterface:
 
 class ExtrinsicReceipt:
 
-    def __init__(self, substrate: SubstrateInterface, extrinsic_hash: str, block_hash: str = None, finalized=None):
+    def __init__(self, substrate: SubstrateInterface, extrinsic_hash: str = None, block_hash: str = None,
+                 block_number: int = None, extrinsic_idx: int = None, finalized=None):
         """
         Object containing information of submitted extrinsic. Block hash where extrinsic is included is required
         when retrieving triggered events or determine if extrinsic was succesfull
@@ -3020,9 +3138,10 @@ class ExtrinsicReceipt:
         self.substrate = substrate
         self.extrinsic_hash = extrinsic_hash
         self.block_hash = block_hash
+        self.block_number = block_number
         self.finalized = finalized
 
-        self.__extrinsic_idx = None
+        self.__extrinsic_idx = extrinsic_idx
         self.__extrinsic = None
 
         self.__triggered_events = None
@@ -3030,6 +3149,42 @@ class ExtrinsicReceipt:
         self.__error_message = None
         self.__weight = None
         self.__total_fee_amount = None
+
+    def get_extrinsic_identifier(self) -> str:
+        """
+        Returns the on-chain identifier for this extrinsic in format "[block_number]-[extrinsic_idx]" e.g. 134324-2
+        Returns
+        -------
+        str
+        """
+        if self.block_number is None:
+            if self.block_hash is None:
+                raise ValueError('Cannot create extrinsic identifier: block_hash is not set')
+
+            self.block_number = self.substrate.get_block_number(self.block_hash)
+
+            if self.block_number is None:
+                raise ValueError('Cannot create extrinsic identifier: unknown block_hash')
+
+        return f'{self.block_number}-{self.extrinsic_idx}'
+
+    @classmethod
+    def create_from_extrinsic_identifier(
+            cls, substrate: SubstrateInterface, extrinsic_identifier: str
+    ) -> "ExtrinsicReceipt":
+        id_parts = extrinsic_identifier.split('-', maxsplit=1)
+        block_number: int = int(id_parts[0])
+        extrinsic_idx: int = int(id_parts[1])
+
+        # Retrieve block hash
+        block_hash = substrate.get_block_hash(block_number)
+
+        return cls(
+            substrate=substrate,
+            block_hash=block_hash,
+            block_number=block_number,
+            extrinsic_idx=extrinsic_idx
+        )
 
     def retrieve_extrinsic(self):
         if not self.block_hash:
@@ -3042,10 +3197,11 @@ class ExtrinsicReceipt:
         extrinsics = block['extrinsics']
 
         if len(extrinsics) > 0:
-            self.__extrinsic_idx = self.__get_extrinsic_index(
-                block_extrinsics=extrinsics,
-                extrinsic_hash=self.extrinsic_hash
-            )
+            if self.__extrinsic_idx is None:
+                self.__extrinsic_idx = self.__get_extrinsic_index(
+                    block_extrinsics=extrinsics,
+                    extrinsic_hash=self.extrinsic_hash
+                )
 
             self.__extrinsic = extrinsics[self.__extrinsic_idx]
 
@@ -3063,7 +3219,7 @@ class ExtrinsicReceipt:
         return self.__extrinsic_idx
 
     @property
-    def extrinsic(self) -> Extrinsic:
+    def extrinsic(self) -> GenericExtrinsic:
         """
         Retrieves the `Extrinsic` subject of this receipt
 
@@ -3108,56 +3264,115 @@ class ExtrinsicReceipt:
 
             for event in self.triggered_events:
                 # Check events
-                if event.event_module.name == 'System' and event.event.name == 'ExtrinsicSuccess':
-                    self.__is_success = True
-                    self.__error_message = None
 
-                    for param in event.params:
-                        if param['type'] == 'DispatchInfo':
-                            self.__weight = param['value']['weight']
+                if self.substrate.implements_scaleinfo():
+                    if event.value['module_id'] == 'System' and event.value['event_id'] == 'ExtrinsicSuccess':
+                        self.__is_success = True
+                        self.__error_message = None
+                        self.__weight = event.value['attributes']['weight']
 
-                elif event.event_module.name == 'System' and event.event.name == 'ExtrinsicFailed':
-                    self.__is_success = False
+                    elif event.value['module_id'] == 'System' and event.value['event_id'] == 'ExtrinsicFailed':
+                        self.__is_success = False
+                        self.__weight = event.value['attributes'][1]['weight']
 
-                    for param in event.params:
-                        if param['type'] == 'DispatchError':
-                            if 'Module' in param['value']:
+                        for param in event.params:
+                            if 'Module' in param:
+
+                                if type(param['Module']) is tuple:
+                                    module_index = param['Module'][0]
+                                    error_index = param['Module'][1]
+                                else:
+                                    module_index = param['Module']['index']
+                                    error_index = param['Module']['error']
+
                                 module_error = self.substrate.metadata_decoder.get_module_error(
-                                    module_index=param['value']['Module']['index'],
-                                    error_index=param['value']['Module']['error']
+                                    module_index=module_index,
+                                    error_index=error_index
                                 )
                                 self.__error_message = {
                                     'type': 'Module',
                                     'name': module_error.name,
                                     'docs': module_error.docs
                                 }
-                            elif 'BadOrigin' in param['value']:
+                            elif 'BadOrigin' in param:
                                 self.__error_message = {
                                     'type': 'System',
                                     'name': 'BadOrigin',
                                     'docs': 'Bad origin'
                                 }
-                            elif 'CannotLookup' in param['value']:
+                            elif 'CannotLookup' in param:
                                 self.__error_message = {
                                     'type': 'System',
                                     'name': 'CannotLookup',
                                     'docs': 'Cannot lookup'
                                 }
-                            elif 'Other' in param['value']:
+                            elif 'Other' in param:
                                 self.__error_message = {
                                     'type': 'System',
                                     'name': 'Other',
                                     'docs': 'Unspecified error occurred'
                                 }
 
-                        if param['type'] == 'DispatchInfo':
-                            self.__weight = param['value']['weight']
+                    elif event.value['module_id'] == 'Treasury' and event.value['event_id'] == 'Deposit':
+                        self.__total_fee_amount += event.value['attributes']
 
-                elif event.event_module.name == 'Treasury' and event.event.name == 'Deposit':
-                    self.__total_fee_amount += event.params[0]['value']
+                    elif event.value['module_id'] == 'Balances' and event.value['event_id'] == 'Deposit':
+                        if type(event.value['attributes']) is tuple:
+                            self.__total_fee_amount += event.value['attributes'][1]
+                        else:
+                            self.__total_fee_amount += event.value['attributes']['amount']
+                else:
 
-                elif event.event_module.name == 'Balances' and event.event.name == 'Deposit':
-                    self.__total_fee_amount += event.params[1]['value']
+                    if event.event_module.name == 'System' and event.event.name == 'ExtrinsicSuccess':
+                        self.__is_success = True
+                        self.__error_message = None
+
+                        for param in event.params:
+                            if param['type'] == 'DispatchInfo':
+                                self.__weight = param['value']['weight']
+
+                    elif event.event_module.name == 'System' and event.event.name == 'ExtrinsicFailed':
+                        self.__is_success = False
+
+                        for param in event.params:
+                            if param['type'] == 'DispatchError':
+                                if 'Module' in param['value']:
+                                    module_error = self.substrate.metadata_decoder.get_module_error(
+                                        module_index=param['value']['Module']['index'],
+                                        error_index=param['value']['Module']['error']
+                                    )
+                                    self.__error_message = {
+                                        'type': 'Module',
+                                        'name': module_error.name,
+                                        'docs': module_error.docs
+                                    }
+                                elif 'BadOrigin' in param['value']:
+                                    self.__error_message = {
+                                        'type': 'System',
+                                        'name': 'BadOrigin',
+                                        'docs': 'Bad origin'
+                                    }
+                                elif 'CannotLookup' in param['value']:
+                                    self.__error_message = {
+                                        'type': 'System',
+                                        'name': 'CannotLookup',
+                                        'docs': 'Cannot lookup'
+                                    }
+                                elif 'Other' in param['value']:
+                                    self.__error_message = {
+                                        'type': 'System',
+                                        'name': 'Other',
+                                        'docs': 'Unspecified error occurred'
+                                    }
+
+                            if param['type'] == 'DispatchInfo':
+                                self.__weight = param['value']['weight']
+
+                    elif event.event_module.name == 'Treasury' and event.event.name == 'Deposit':
+                        self.__total_fee_amount += event.params[0]['value']
+
+                    elif event.event_module.name == 'Balances' and event.event.name == 'Deposit':
+                        self.__total_fee_amount += event.params[1]['value']
 
     @property
     def is_success(self) -> bool:
@@ -3226,7 +3441,7 @@ class ExtrinsicReceipt:
         Returns the index of a provided extrinsic
         """
         for idx, extrinsic in enumerate(block_extrinsics):
-            if extrinsic.extrinsic_hash == extrinsic_hash.replace('0x', ''):
+            if extrinsic.extrinsic_hash and f'0x{extrinsic.extrinsic_hash.hex()}' == extrinsic_hash:
                 return idx
         raise ExtrinsicNotFound()
 

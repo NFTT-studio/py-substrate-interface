@@ -23,7 +23,8 @@ from substrateinterface import SubstrateInterface
 
 from test.fixtures import metadata_node_template_hex
 
-from scalecodec import MetadataDecoder, ScaleBytes, Vec, GenericAddress
+from scalecodec.base import ScaleBytes
+from scalecodec.types import Vec, GenericAddress
 
 
 class BlockTestCase(unittest.TestCase):
@@ -31,7 +32,9 @@ class BlockTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.substrate = SubstrateInterface(url='dummy', ss58_format=42, type_registry_preset='substrate-node-template')
-        metadata_decoder = MetadataDecoder(ScaleBytes(metadata_node_template_hex))
+        metadata_decoder = cls.substrate.runtime_config.create_scale_object(
+            'MetadataVersioned', ScaleBytes(metadata_node_template_hex)
+        )
         metadata_decoder.decode()
         cls.substrate.get_block_metadata = MagicMock(return_value=metadata_decoder)
 
@@ -164,9 +167,9 @@ class BlockTestCase(unittest.TestCase):
         )
         extrinsics = block['extrinsics']
 
-        self.assertEqual(extrinsics[0].call_module.name, 'Timestamp')
-        self.assertEqual(extrinsics[0].call.name, 'set')
-        self.assertEqual(extrinsics[0].params[0]['value'], '2021-01-27T10:44:42.004000')
+        self.assertEqual(extrinsics[0]['call']['call_module'].name, 'Timestamp')
+        self.assertEqual(extrinsics[0]['call']['call_function'].name, 'set')
+        self.assertEqual(extrinsics[0]['call']['call_args']['now'], 1611744282004)
 
     def test_get_by_block_number(self):
 
@@ -175,9 +178,9 @@ class BlockTestCase(unittest.TestCase):
         )
         extrinsics = block['extrinsics']
 
-        self.assertEqual(extrinsics[0].call_module.name, 'Timestamp')
-        self.assertEqual(extrinsics[0].call.name, 'set')
-        self.assertEqual(extrinsics[0].params[0]['value'], '2021-01-27T10:44:42.004000')
+        self.assertEqual(extrinsics[0]['call']['call_module'].name, 'Timestamp')
+        self.assertEqual(extrinsics[0]['call']['call_function'].name, 'set')
+        self.assertEqual(extrinsics[0]['call']['call_args']['now'], 1611744282004)
 
     def test_get_block_by_head(self):
 
@@ -224,7 +227,7 @@ class BlockTestCase(unittest.TestCase):
 
         self.assertEqual(extrinsics[0], None)
         self.assertEqual(extrinsics[1], None)
-        self.assertEqual(extrinsics[2].params[0]['value'], '2021-01-27T10:44:42.004000')
+        self.assertEqual(extrinsics[2].value['call']['call_args'][0]['value'], 1611744282004)
         self.assertEqual(extrinsics[3], None)
 
     def test_include_author(self):
@@ -245,11 +248,11 @@ class BlockTestCase(unittest.TestCase):
     def test_subscribe_block_headers(self):
 
         def subscription_handler(obj, update_nr, subscription_id):
-            return f"callback: '{obj['header']['hash']}"
+            return f"callback: {obj['header']['number']}"
 
         result = self.substrate.subscribe_block_headers(subscription_handler)
 
-        self.assertEqual(f"callback: '0xec828914eca09331dad704404479e2899a971a9b5948345dc40abca4ac818f93", result)
+        self.assertEqual(f"callback: 103", result)
 
     def test_check_requirements(self):
         self.assertRaises(ValueError, self.substrate.get_block,

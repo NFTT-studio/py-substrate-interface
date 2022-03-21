@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from substrateinterface import SubstrateInterface
+from substrateinterface.exceptions import StorageFunctionNotFound
 from test import settings
 
 
@@ -48,6 +49,7 @@ class QueryTestCase(unittest.TestCase):
 
         self.assertEqual(7673, result.value['nonce'])
         self.assertEqual(637747267365404068, result.value['data']['free'])
+        self.assertEqual(result.meta_info['result_found'], True)
 
     def test_system_account_non_existing(self):
         result = self.kusama_substrate.query(
@@ -60,12 +62,12 @@ class QueryTestCase(unittest.TestCase):
             {
                 'nonce': 0, 'consumers': 0, 'providers': 0, 'sufficients': 0,
                 'data': {
-                    'free': 0, 'reserved': 0, 'miscFrozen': 0, 'feeFrozen': 0
+                    'free': 0, 'reserved': 0, 'misc_frozen': 0, 'fee_frozen': 0
                 }
             }, result.value)
 
     def test_non_existing_query(self):
-        with self.assertRaises(ValueError) as cm:
+        with self.assertRaises(StorageFunctionNotFound) as cm:
             self.kusama_substrate.query("Unknown", "StorageFunction")
 
         self.assertEqual('Storage function "Unknown.StorageFunction" not found', str(cm.exception))
@@ -78,6 +80,7 @@ class QueryTestCase(unittest.TestCase):
         )
 
         self.assertEqual(84, result.value)
+        self.assertEqual(result.meta_info['result_found'], False)
 
     def test_modifier_option_result(self):
 
@@ -89,92 +92,23 @@ class QueryTestCase(unittest.TestCase):
         )
 
         self.assertIsNone(result.value)
+        self.assertEqual(result.meta_info['result_found'], False)
 
     def test_identity_hasher(self):
         result = self.kusama_substrate.query("Claims", "Claims", ["0x00000a9c44f24e314127af63ae55b864a28d7aee"])
         self.assertEqual(45880000000000, result.value)
 
-    def test_map_type_iterate_map(self):
+    def test_well_known_keys_result(self):
+        result = self.kusama_substrate.query("Substrate", "Code")
+        self.assertIsNotNone(result.value)
 
-        orig_rpc_request = self.kusama_substrate.rpc_request
+    def test_well_known_keys_default(self):
+        result = self.kusama_substrate.query("Substrate", "HeapPages")
+        self.assertEqual(0, result.value)
 
-        def mocked_request(method, params):
-            if method == 'state_getPairs':
-                return {
-                    'jsonrpc': '2.0',
-                    'result': [
-                        ['0x5f3e4907f716ac89b6347d15ececedca3ed14b45ed20d054f05e37e2542cfe70e535263148daaf49be5ddb1579b72e84524fc29e78609e3caf42e85aa118ebfe0b0ad404b5bdd25f', '0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d']
-                    ],
-                    'id': 8
-                }
-            return orig_rpc_request(method, params)
-
-        self.kusama_substrate.rpc_request = MagicMock(side_effect=mocked_request)
-
-        all_bonded_stash_ctrls = self.kusama_substrate.iterate_map(
-            module='Staking',
-            storage_function='Bonded'
-        )
-
-        self.assertEqual(1, len(all_bonded_stash_ctrls))
-        self.assertEqual(
-            'GsvVmjr1CBHwQHw84pPHMDxgNY3iBLz6Qn7qS3CH8qPhrHz', all_bonded_stash_ctrls[0][0]
-        )
-        self.assertEqual(
-            'HNZata7iMYWmk5RvZRTiAsSDhV8366zq2YGb3tLH5Upf74F', all_bonded_stash_ctrls[0][1]
-        )
-
-    def test_identity_iterate_map(self):
-
-        orig_rpc_request = self.kusama_substrate.rpc_request
-
-        def mocked_request(method, params):
-            if method == 'state_getPairs':
-                return {
-                    'jsonrpc': '2.0',
-                    'result': [
-                        ['0x8985776095addd4789fccbce8ca77b23e9d6db8868a37d79930bc3f7f33950d1484aa6d852c96a543053f402f397a285d768c12afde025ce37244f6238714b4c', '0x0001081234'],
-                        ['0x8985776095addd4789fccbce8ca77b23e9d6db8868a37d79930bc3f7f33950d14e8c9e912385f4025cf1e341b7462ab33765b6a564e71e8d2bf29f45d3b8c99c', '0x0001083456']
-                    ], 'id': 8
-                }
-            return orig_rpc_request(method, params)
-
-        self.kusama_substrate.rpc_request = MagicMock(side_effect=mocked_request)
-
-        result = self.kusama_substrate.iterate_map('TechnicalCommittee', 'ProposalOf')
-
-        self.assertEqual(2, len(result))
-        self.assertEqual('0x484aa6d852c96a543053f402f397a285d768c12afde025ce37244f6238714b4c', result[0][0])
-        self.assertEqual('System', result[1][1]['call_module'])
-        self.assertEqual('remark', result[1][1]['call_function'])
-        self.assertEqual('0x4e8c9e912385f4025cf1e341b7462ab33765b6a564e71e8d2bf29f45d3b8c99c', result[1][0])
-
-    def test_blake2_256_iterate_map(self):
-
-        storage_functions = self.kusama_substrate.get_metadata_storage_functions()
-
-        orig_rpc_request = self.kusama_substrate.rpc_request
-
-        def mocked_request(method, params):
-            if method == 'state_getPairs':
-                return {
-                    'jsonrpc': '2.0',
-                    'result': [
-                        ['0x8985776095addd4789fccbce8ca77b23e9d6db8868a37d79930bc3f7f33950d1484aa6d852c96a543053f402f397a285d768c12afde025ce37244f6238714b4c', '0x0001081234'],
-                        ['0x8985776095addd4789fccbce8ca77b23e9d6db8868a37d79930bc3f7f33950d14e8c9e912385f4025cf1e341b7462ab33765b6a564e71e8d2bf29f45d3b8c99c', '0x0001083456']
-                    ], 'id': 8
-                }
-            return orig_rpc_request(method, params)
-
-        self.kusama_substrate.rpc_request = MagicMock(side_effect=mocked_request)
-
-        result = self.kusama_substrate.iterate_map('TechnicalCommittee', 'ProposalOf')
-
-        self.assertEqual(2, len(result))
-        self.assertEqual('0x484aa6d852c96a543053f402f397a285d768c12afde025ce37244f6238714b4c', result[0][0])
-        self.assertEqual('System', result[1][1]['call_module'])
-        self.assertEqual('remark', result[1][1]['call_function'])
-        self.assertEqual('0x4e8c9e912385f4025cf1e341b7462ab33765b6a564e71e8d2bf29f45d3b8c99c', result[1][0])
+    def test_well_known_keys_not_found(self):
+        with self.assertRaises(StorageFunctionNotFound):
+            self.kusama_substrate.query("Substrate", "Unknown")
 
 
 if __name__ == '__main__':

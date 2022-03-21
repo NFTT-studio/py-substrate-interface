@@ -17,7 +17,7 @@
 import unittest
 from unittest.mock import MagicMock
 
-from scalecodec import GenericAccountId
+from scalecodec.types import GenericAccountId
 
 from substrateinterface.exceptions import SubstrateRequestException
 
@@ -71,8 +71,6 @@ class QueryMapTestCase(unittest.TestCase):
         records = [item for item in result]
 
         self.assertEqual(3, len(records))
-        self.assertEqual('H160', records[0][0].__class__.__name__)
-        self.assertEqual('U128', records[0][1].__class__.__name__)
         self.assertEqual(45880000000000, records[0][1].value)
         self.assertEqual('0x00000a9c44f24e314127af63ae55b864a28d7aee', records[0][0].value)
         self.assertEqual('0x00002f21194993a750972574e2d82ce8c95078a6', records[1][0].value)
@@ -221,7 +219,7 @@ class QueryMapTestCase(unittest.TestCase):
                 module='Staking',
                 storage_function='ErasStakers'
             )
-        self.assertEqual('"params" with 1 element is mandatory with a DoubleMap storage function', str(cm.exception))
+        self.assertEqual('Storage function map requires 1 parameters, 0 given', str(cm.exception))
 
     def test_double_map_too_many_params(self):
         with self.assertRaises(ValueError) as cm:
@@ -230,7 +228,7 @@ class QueryMapTestCase(unittest.TestCase):
                 storage_function='ErasStakers',
                 params=[21000000, 2]
             )
-        self.assertEqual('"params" with 1 element is mandatory with a DoubleMap storage function', str(cm.exception))
+        self.assertEqual('Storage function map requires 1 parameters, 2 given', str(cm.exception))
 
     def test_map_with_param(self):
         with self.assertRaises(ValueError) as cm:
@@ -239,7 +237,7 @@ class QueryMapTestCase(unittest.TestCase):
                 storage_function='Account',
                 params=[2]
             )
-        self.assertEqual('"params" is only used with a DoubleMap storage function', str(cm.exception))
+        self.assertEqual('Storage function map requires 0 parameters, 1 given', str(cm.exception))
 
 
 if __name__ == '__main__':

@@ -16,7 +16,7 @@ management and versioning of types.
 
 * [Documentation](#documentation)
 * [Installation](#installation)
-* [Initialization](#hello-world--the-flipper)
+* [Initialization](#initialization)
   * [Autodiscover mode](#autodiscover-mode)
   * [Manually set required properties](#manually-set-required-properties)  
   * [Substrate Node Template](#substrate-node-template)
@@ -32,6 +32,7 @@ management and versioning of types.
   * [Create mortal extrinsics](#create-mortal-extrinsics)
   * [Keypair creation and signing](#keypair-creation-and-signing)
   * [Creating keypairs with soft and hard key derivation paths](#creating-keypairs-with-soft-and-hard-key-derivation-paths)
+  * [Creating ECDSA keypairs with BIP44 derivation paths](#creating-ecdsa-keypairs-with-bip44-derivation-paths)
   * [Getting estimate of network fees for extrinsic in advance](#getting-estimate-of-network-fees-for-extrinsic-in-advance)
   * [Offline signing of extrinsics](#offline-signing-of-extrinsics)
   * [Accessing runtime constants](#accessing-runtime-constants)
@@ -63,8 +64,9 @@ substrate = SubstrateInterface(
 When only an `url` is provided, it tries to determine certain properties like `ss58_format` and 
 `type_registry_preset` automatically by calling the RPC method `system_properties`. 
 
-At the moment this will work for Polkadot, Kusama, Kulupu and Westend nodes, for other chains the `ss58_format` 
-(default 42) and  `type_registry` (defaults to latest vanilla Substrate types) should be set manually. 
+At the moment this will work for most `MetadataV14` and above chains like Polkadot, Kusama, Acala, Moonbeam, for other 
+chains the `ss58_format` (default 42) and  `type_registry` (defaults to the latest vanilla Substrate types) should be 
+set manually. 
 
 ### Manually set required properties
 
@@ -120,42 +122,11 @@ substrate = SubstrateInterface(
  
 ```
 
-If custom types are introduced in the Substrate chain, the following example will add compatibility by creating a custom type 
-registry JSON file and including this during initialization:
-
-```json
-{
-  "runtime_id": 2,
-  "types": {
-    "MyCustomInt": "u32",
-    "MyStruct": {
-      "type": "struct",
-      "type_mapping": [
-         ["account", "AccountId"],
-         ["message", "Vec<u8>"]
-      ]
-    }
-  },
-  "versioning": [
-  ]
-}
-```
-
-```python
-custom_type_registry = load_type_registry_file("my-custom-types.json")
-
-substrate = SubstrateInterface(
-    url="ws://127.0.0.1:9944",
-    ss58_format=42,
-    type_registry_preset='substrate-node-template',
-    type_registry=custom_type_registry
-)
- 
-```
-
 ## Features
 
-### Retrieve extrinsics for a certain block
+### Retrieve extrinsics for a certain block 
+
+#### Method 1: access serialized value
 
 ```python
 # Set block_hash to None for chaintip
@@ -166,21 +137,52 @@ result = substrate.get_block(block_hash=block_hash)
 
 for extrinsic in result['extrinsics']:
 
-    if extrinsic.address:
-        signed_by_address = extrinsic.address.value
+    if 'address' in extrinsic.value:
+        signed_by_address = extrinsic.value['address']
     else:
         signed_by_address = None
 
     print('\nPallet: {}\nCall: {}\nSigned by: {}'.format(
-        extrinsic.call_module.name,
-        extrinsic.call.name,
+        extrinsic.value["call"]["call_module"],
+        extrinsic.value["call"]["call_function"],
         signed_by_address
     ))
 
     # Loop through call params
-    for param in extrinsic.params:
+    for param in extrinsic.value["call"]['call_args']:
 
-        if param['type'] == 'Compact<Balance>':
+        if param['type'] == 'Balance':
+            param['value'] = '{} {}'.format(param['value'] / 10 ** substrate.token_decimals, substrate.token_symbol)
+
+        print("Param '{}': {}".format(param['name'], param['value']))
+```
+
+#### Method 2: access nested objects
+
+```python
+# Set block_hash to None for chaintip
+block_hash = "0x51d15792ff3c5ee9c6b24ddccd95b377d5cccc759b8e76e5de9250cf58225087"
+
+# Retrieve extrinsics in block
+result = substrate.get_block(block_hash=block_hash)
+
+for extrinsic in result['extrinsics']:
+
+    if 'address' in extrinsic:
+        signed_by_address = extrinsic['address'].value
+    else:
+        signed_by_address = None
+
+    print('\nPallet: {}\nCall: {}\nSigned by: {}'.format(
+        extrinsic["call"]["call_module"].name,
+        extrinsic["call"]["call_function"].name,
+        signed_by_address
+    ))
+
+    # Loop through call params
+    for param in extrinsic["call"]['call_args']:
+
+        if param['type'] == 'Balance':
             param['value'] = '{} {}'.format(param['value'] / 10 ** substrate.token_decimals, substrate.token_symbol)
 
         print("Param '{}': {}".format(param['name'], param['value']))
@@ -204,7 +206,7 @@ result = substrate.subscribe_block_headers(subscription_handler, include_author=
 The modules and storage functions are provided in the metadata (see `substrate.get_metadata_storage_functions()`),
 parameters will be automatically converted to SCALE-bytes (also including decoding of SS58 addresses).
 
-Example: 
+#### Example 
 
 ```python
 result = substrate.query(
@@ -217,7 +219,7 @@ print(result.value['nonce']) #  7695
 print(result.value['data']['free']) # 635278638077956496
 ```
 
-Or get the account info at a specific block hash:
+#### Get the account info at a specific block hash:
 
 ```python
 account_info = substrate.query(
@@ -227,8 +229,91 @@ account_info = substrate.query(
     block_hash='0x176e064454388fd78941a0bace38db424e71db9d5d5ed0272ead7003a02234fa'
 )
 
-print(account_info.value['nonce']) #  7673
-print(account_info.value['data']['free']) # 637747267365404068
+print(account_info['nonce'].value) #  7673
+print(account_info['data']['free'].value) # 637747267365404068
+```
+
+#### Type information about how to format parameters
+
+To retrieve more information about how to format the parameters of a storage function:
+
+```python
+storage_function = self.substrate.get_metadata_storage_function("Tokens", "TotalIssuance")
+
+print(storage_function.get_param_info())
+# [{'variant': {'variants': [{'name': 'Token', 'fields': [{'name': None, 'type': 44, 'typeName': 'TokenSymbol', 'docs': []}], 'index': 0, 'docs': [], 'value': {'variant': {'variants': [{'name': 'ACA', 'fields': [], 'index': 0, 'docs': []}, {'name': 'AUSD', 'fields': [], 'index': 1, 'docs': []}, {'name': 'DOT', 'fields': [], 'index': 2, 'docs': []}, {'name': 'LDOT', 'fields': [], 'index': 3, 'docs': []}, {'name': 'RENBTC', 'fields': [], 'index': 20, 'docs': []}, {'name': 'CASH', 'fields': [], 'index': 21, 'docs': []}, {'name': 'KAR', 'fields': [], 'index': 128, 'docs': []}, {'name': 'KUSD', 'fields': [], 'index': 129, 'docs': []}, {'name': 'KSM', 'fields': [], 'index': 130, 'docs': []}, {'name': 'LKSM', 'fields': [], 'index': 131, 'docs': []}, {'name': 'TAI', 'fields': [], 'index': 132, 'docs': []}, {'name': 'BNC', 'fields': [], 'index': 168, 'docs': []}, {'name': 'VSKSM', 'fields': [], 'index': 169, 'docs': []}, {'name': 'PHA', 'fields': [], 'index': 170, 'docs': []}, {'name': 'KINT', 'fields': [], 'index': 171, 'docs': []}, {'name': 'KBTC', 'fields': [], 'index': 172, 'docs': []}]}}}, {'name': 'DexShare', 'fields': [{'name': None, 'type': 45, 'typeName': 'DexShare', 'docs': []}, {'name': None, 'type': 45, 'typeName': 'DexShare', 'docs': []}], 'index': 1, 'docs': [], 'value': {'variant': {'variants': [{'name': 'Token', 'fields': [{'name': None, 'type': 44, 'typeName': 'TokenSymbol', 'docs': []}], 'index': 0, 'docs': [], 'value': {'variant': {'variants': [{'name': 'ACA', 'fields': [], 'index': 0, 'docs': []}, {'name': 'AUSD', 'fields': [], 'index': 1, 'docs': []}, {'name': 'DOT', 'fields': [], 'index': 2, 'docs': []}, {'name': 'LDOT', 'fields': [], 'index': 3, 'docs': []}, {'name': 'RENBTC', 'fields': [], 'index': 20, 'docs': []}, {'name': 'CASH', 'fields': [], 'index': 21, 'docs': []}, {'name': 'KAR', 'fields': [], 'index': 128, 'docs': []}, {'name': 'KUSD', 'fields': [], 'index': 129, 'docs': []}, {'name': 'KSM', 'fields': [], 'index': 130, 'docs': []}, {'name': 'LKSM', 'fields': [], 'index': 131, 'docs': []}, {'name': 'TAI', 'fields': [], 'index': 132, 'docs': []}, {'name': 'BNC', 'fields': [], 'index': 168, 'docs': []}, {'name': 'VSKSM', 'fields': [], 'index': 169, 'docs': []}, {'name': 'PHA', 'fields': [], 'index': 170, 'docs': []}, {'name': 'KINT', 'fields': [], 'index': 171, 'docs': []}, {'name': 'KBTC', 'fields': [], 'index': 172, 'docs': []}]}}}, {'name': 'Erc20', 'fields': [{'name': None, 'type': 46, 'typeName': 'EvmAddress', 'docs': []}], 'index': 1, 'docs': [], 'value': {'composite': {'fields': [{'name': None, 'type': 47, 'typeName': '[u8; 20]', 'docs': [], 'value': {'array': {'len': 20, 'type': 2, 'value': {'primitive': 'u8'}}}}]}}}, {'name': 'LiquidCrowdloan', 'fields': [{'name': None, 'type': 4, 'typeName': 'Lease', 'docs': []}], 'index': 2, 'docs': [], 'value': {'primitive': 'u32'}}, {'name': 'ForeignAsset', 'fields': [{'name': None, 'type': 36, 'typeName': 'ForeignAssetId', 'docs': []}], 'index': 3, 'docs': [], 'value': {'primitive': 'u16'}}]}}}, {'name': 'Erc20', 'fields': [{'name': None, 'type': 46, 'typeName': 'EvmAddress', 'docs': []}], 'index': 2, 'docs': [], 'value': {'composite': {'fields': [{'name': None, 'type': 47, 'typeName': '[u8; 20]', 'docs': [], 'value': {'array': {'len': 20, 'type': 2, 'value': {'primitive': 'u8'}}}}]}}}, {'name': 'StableAssetPoolToken', 'fields': [{'name': None, 'type': 4, 'typeName': 'StableAssetPoolId', 'docs': []}], 'index': 3, 'docs': [], 'value': {'primitive': 'u32'}}, {'name': 'LiquidCrowdloan', 'fields': [{'name': None, 'type': 4, 'typeName': 'Lease', 'docs': []}], 'index': 4, 'docs': [], 'value': {'primitive': 'u32'}}, {'name': 'ForeignAsset', 'fields': [{'name': None, 'type': 36, 'typeName': 'ForeignAssetId', 'docs': []}], 'index': 5, 'docs': [], 'value': {'primitive': 'u16'}}]}}]
+```
+
+The `query_map()` function can also be used to see examples of used parameters:
+
+```python
+result = substrate.query_map("Tokens", "TotalIssuance")
+
+print(list(result))
+# [[<scale_info::43(value={'DexShare': ({'Token': 'KSM'}, {'Token': 'LKSM'})})>, <U128(value=11513623028320124)>], [<scale_info::43(value={'DexShare': ({'Token': 'KUSD'}, {'Token': 'BNC'})})>, <U128(value=2689948474603237982)>], [<scale_info::43(value={'DexShare': ({'Token': 'KSM'}, {'ForeignAsset': 0})})>, <U128(value=5285939253205090)>], [<scale_info::43(value={'Token': 'VSKSM'})>, <U128(value=273783457141483)>], [<scale_info::43(value={'DexShare': ({'Token': 'KAR'}, {'Token': 'KSM'})})>, <U128(value=1175872380578192993)>], [<scale_info::43(value={'DexShare': ({'Token': 'KUSD'}, {'Token': 'KSM'})})>, <U128(value=3857629383220790030)>], [<scale_info::43(value={'DexShare': ({'Token': 'KUSD'}, {'ForeignAsset': 0})})>, <U128(value=494116000924219532)>], [<scale_info::43(value={'Token': 'KSM'})>, <U128(value=77261320750464113)>], [<scale_info::43(value={'Token': 'TAI'})>, <U128(value=10000000000000000000)>], [<scale_info::43(value={'Token': 'LKSM'})>, <U128(value=681009957030687853)>], [<scale_info::43(value={'DexShare': ({'Token': 'KUSD'}, {'Token': 'LKSM'})})>, <U128(value=4873824439975242272)>], [<scale_info::43(value={'Token': 'KUSD'})>, <U128(value=5799665835441836111)>], [<scale_info::43(value={'ForeignAsset': 0})>, <U128(value=2319784932899895)>], [<scale_info::43(value={'DexShare': ({'Token': 'KAR'}, {'Token': 'LKSM'})})>, <U128(value=635158183535133903)>], [<scale_info::43(value={'Token': 'BNC'})>, <U128(value=1163757660576711961)>]]
+```
+
+### Using ScaleType objects
+
+The result of the previous storage query example is a `ScaleType` object, more specific a `Struct`. 
+
+The nested object structure of this `account_info` object is as follows:
+```
+account_info = <AccountInfo(value={'nonce': <U32(value=5)>, 'consumers': <U32(value=0)>, 'providers': <U32(value=1)>, 'sufficients': <U32(value=0)>, 'data': <AccountData(value={'free': 1152921503981846391, 'reserved': 0, 'misc_frozen': 0, 'fee_frozen': 0})>})>
+```
+
+Every `ScaleType` have the following characteristics:
+
+#### Shorthand lookup of nested types
+
+Inside the `AccountInfo` struct there are several `U32` objects that represents for example a nonce or the amount of provider, 
+also another struct object `AccountData` which contains more nested types. 
+
+
+To access these nested structures you can access those formally using:
+
+`account_info.value_object['data'].value_object['free']`
+
+As a convenient shorthand you can also use:
+
+`account_info['data']['free']`
+
+`ScaleType` objects can also be automatically converted to an iterable, so if the object
+is for example the `others` in the result Struct of `Staking.eraStakers` can be iterated via:
+
+```python
+for other_info in era_stakers['others']:
+    print(other_info['who'], other_info['value'])
+```
+
+#### Serializable
+Each `ScaleType` holds a complete serialized version of itself in the `account_info.serialize()` property, so it can easily store or used to create JSON strings.
+
+So the whole result of `account_info.serialize()` will be a `dict` containing the following:
+
+```json
+{
+    "nonce": 5,
+    "consumers": 0,
+    "providers": 1,
+    "sufficients": 0,
+    "data": {
+        "free": 1152921503981846391,
+        "reserved": 0,
+        "misc_frozen": 0,
+        "fee_frozen": 0
+    }
+}
+```
+
+#### Comparing values with `ScaleType` objects
+
+It is possible to compare ScaleType objects directly to Python primitives, internally the serialized `value` attribute
+is compared:
+
+```python
+metadata_obj[1][1]['extrinsic']['version'] # '<U8(value=4)>'
+metadata_obj[1][1]['extrinsic']['version'] == 4 # True
 ```
 
 ### Storage subscriptions
@@ -272,7 +357,7 @@ for account, account_info in result:
     print(f"Free balance of account '{account.value}': {account_info.value['data']['free']}")
 ```
 
-These results are transparantly retrieved in batches capped by the `page_size` kwarg, currently the 
+These results are transparently retrieved in batches capped by the `page_size` kwarg, currently the 
 maximum `page_size` restricted by the RPC node is 1000    
 
 ```python
@@ -353,10 +438,8 @@ print(receipt.error_message['name']) # 'LiquidityRestrictions'
 
 ```python
 
-receipt = ExtrinsicReceipt(
-    substrate=substrate,
-    extrinsic_hash="0x56fea3010910bd8c0c97253ffe308dc13d1613b7e952e7e2028257d2b83c027a",
-    block_hash="0x04fb003f8bc999eeb284aa8e74f2c6f63cf5bd5c00d0d0da4cd4d253a643e4c9"
+receipt = ExtrinsicReceipt.create_from_extrinsic_identifier(
+    substrate=substrate, extrinsic_identifier="5233297-1"
 )
 
 print(receipt.is_success) # False
@@ -428,15 +511,18 @@ print('Current value of "get":', result.contract_result_data)
 gas_predit_result = contract.read(keypair, 'flip')
 
 print('Result of dry-run: ', gas_predit_result.contract_result_data)
-print('Gas estimate: ', gas_predit_result.gas_consumed)
+print('Gas estimate: ', gas_predit_result.gas_required)
 
-# Do the actual transfer
+# Do the actual call
 print('Executing contract call...')
 contract_receipt = contract.exec(keypair, 'flip', args={
 
-}, gas_limit=gas_predit_result.gas_consumed)
+}, gas_limit=gas_predit_result.gas_required)
 
-print(f'Events triggered in contract: {contract_receipt.contract_events}')
+if contract_receipt.is_success:
+    print(f'Events triggered in contract: {contract_receipt.contract_events}')
+else:
+    print(f'Call failed: {contract_receipt.error_message}')
 ```
 
 See complete [code example](https://github.com/polkascan/py-substrate-interface/blob/master/examples/create_and_exec_contract.py) for more details
@@ -465,10 +551,10 @@ if keypair.verify("Test123", signature):
     print('Verified')
 ```
 
-By default, a keypair is using SR25519 cryptography, alternatively ED25519 can be explictly specified:
+By default, a keypair is using SR25519 cryptography, alternatively ED25519 and ECDSA can be explicitly specified:
 
 ```python
-keypair = Keypair.create_from_mnemonic(mnemonic, crypto_type=KeypairType.ED25519)
+keypair = Keypair.create_from_mnemonic(mnemonic, crypto_type=KeypairType.ECDSA)
 ```
 
 ### Creating keypairs with soft and hard key derivation paths
@@ -483,6 +569,14 @@ By omitting the mnemonic the default development mnemonic is used:
 ```python
 keypair = Keypair.create_from_uri('//Alice')
 ```
+
+### Creating ECDSA keypairs with BIP44 derivation paths 
+
+```python
+mnemonic = Keypair.generate_mnemonic()
+keypair = Keypair.create_from_uri(f"{mnemonic}/m/44'/60'/0'/0/0", crypto_type=KeypairType.ECDSA)
+```
+
 
 ### Getting estimate of network fees for extrinsic in advance
 
@@ -583,7 +677,9 @@ with SubstrateInterface(url="wss://rpc.polkadot.io") as substrate:
 
 ## Keeping type registry presets up to date
 
-When on-chain runtime upgrades occur, types used in call- or storage functions can be added or modified. Therefor it is
+> :information_source: Only applicable for chains with metadata < V14
+
+When on-chain runtime upgrades occur, types used in call- or storage functions can be added or modified. Therefore it is
 important to keep the type registry presets up to date, otherwise this can lead to decoding errors like 
 `RemainingScaleBytesNotEmptyException`. 
 
