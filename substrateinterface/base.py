@@ -909,58 +909,6 @@ class SubstrateInterface:
         else:
             raise SubstrateRequestException("Unknown error occurred during retrieval of events")
 
-<<<<<<< HEAD
-    def get_block_events(self, block_hash, metadata_decoder=None):
-        """
-        A convenience method to fetch the undecoded events from storage
-
-        Parameters
-        ----------
-        block_hash
-        metadata_decoder
-
-        Returns
-        -------
-
-        """
-
-        warnings.warn("'get_block_events' will be replaced by 'get_events'", DeprecationWarning)
-
-        if metadata_decoder and metadata_decoder.version.index >= 9:
-            storage_hash = STORAGE_HASH_SYSTEM_EVENTS_V9
-        else:
-            storage_hash = STORAGE_HASH_SYSTEM_EVENTS
-
-        response = self.rpc_request("state_getStorageAt", [storage_hash, block_hash])
-
-        if 'error' in response:
-            raise SubstrateRequestException(response['error']['message'])
-
-        if response.get('result'):
-
-            if metadata_decoder:
-                # Process events
-                events_decoder = EventsDecoder(
-                    data=ScaleBytes(response.get('result')),
-                    metadata=metadata_decoder,
-                    runtime_config=self.runtime_config
-                )
-                try:
-                    events_decoder.decode()
-                    return events_decoder
-                except Exception as e:
-                    print('[PLAN-A] error decoding events, setting events to []', e);
-                    events_decoder.elements = []
-                    # return response
-                    return events_decoder
-
-            else:
-                return response
-        else:
-            raise SubstrateRequestException("Error occurred during retrieval of events")
-
-=======
->>>>>>> upstream/master
     def get_block_runtime_version(self, block_hash):
         """
         Retrieve the runtime version id of given block_hash
